@@ -1,0 +1,42 @@
+{
+  "name": "@avowa/runtime",
+  "version": "0.11.0",
+  "description": "Avowa Runtime SDK — emit live AI-inference signals as observed evidence. Metadata only; never prompts or completions.",
+  "type": "module",
+  "main": "avowa-runtime.js",
+  "exports": {
+    ".": "./avowa-runtime.js"
+  },
+  "files": [
+    "avowa-runtime.js",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "avowa",
+    "ai-trust",
+    "evidence",
+    "compliance",
+    "observability",
+    "llm"
+  ],
+  "license": "Apache-2.0",
+  "author": "Avowa, Inc.",
+  "homepage": "https://avowa.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Avowa-AI/avowa-runtime-sdk.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "bugs": {
+    "url": "https://github.com/Avowa-AI/avowa-runtime-sdk/issues"
+  }
+}

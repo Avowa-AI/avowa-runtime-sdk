@@ -1,0 +1,38 @@
+# Every push: the Python SDK installs and runs on each Python it claims; the JS SDK's tests pass on
+# each Node it claims — against exactly the files that are published.
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install ./python
+      - working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import avowa_runtime, avowa_runtime.adapters, avowa_runtime.langchain, avowa_runtime.auto, avowa_runtime.run, avowa_runtime.bench; print(avowa_runtime.__version__)"
+          python -m avowa_runtime.bench --calls 200 --json > /dev/null
+  js:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - working-directory: js
+        run: node --test

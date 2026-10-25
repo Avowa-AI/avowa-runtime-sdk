@@ -1,0 +1,37 @@
+[project]
+name = "avowa-runtime"
+version = "0.11.0"
+description = "Avowa Runtime SDK — emit live AI-inference signals to Avowa as evidence."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Avowa, Inc." }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["avowa", "ai-trust", "evidence", "observability", "compliance"]
+dependencies = []  # stdlib-only by design
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+  "Topic :: System :: Monitoring",
+]
+
+
+[project.scripts]
+avowa-run = "avowa_runtime.run:main"
+
+[project.urls]
+Homepage = "https://avowa.ai"
+Repository = "https://github.com/Avowa-AI/avowa-runtime-sdk"
+Issues = "https://github.com/Avowa-AI/avowa-runtime-sdk/issues"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["avowa_runtime"]
+
+[tool.setuptools.package-data]
+avowa_runtime = ["bootstrap/*.py"]

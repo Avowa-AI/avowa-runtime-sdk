@@ -1,0 +1,122 @@
+# Publishing. PyPI and npm trust this workflow through OIDC ("trusted publishing"), and each publish
+# waits in a GitHub environment for a maintainer's approval. PyPI gets build attestations, npm gets
+# provenance — both point back to this commit.
+#
+#   git tag v0.11.0 && git push origin v0.11.0   → npm (and PyPI once the PYPI_ENABLED variable is true)
+#   Actions → release → Run workflow:
+#       mode = rehearsal   TestPyPI + `npm publish --dry-run`        (any branch)
+#       mode = npm | pypi  publish just that registry for a tag       (pick the tag in "Use workflow from")
+#
+# The very first npm release may use a short-lived NPM_TOKEN secret, because npm only lets a trusted
+# publisher be configured on a package that already exists. Delete the secret straight afterwards.
+name: release
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "rehearsal, or publish one registry for the selected tag"
+        type: choice
+        options: [rehearsal, npm, pypi]
+        default: rehearsal
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: One version — the tag, pyproject, __init__ and package.json agree
+        run: |
+          py=$(python -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project']['version'])")
+          init=$(python -c "import re; print(re.search(r'^__version__ = \"([^\"]+)\"', open('python/avowa_runtime/__init__.py').read(), re.M).group(1))")
+          js=$(node -p "require('./js/package.json').version")
+          echo "pyproject $py · __init__ $init · package.json $js"
+          [ "$py" = "$init" ] && [ "$py" = "$js" ] || { echo "::error::versions differ"; exit 1; }
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$py" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match version $py"; exit 1
+          fi
+          if [ "${{ inputs.mode }}" = "npm" ] || [ "${{ inputs.mode }}" = "pypi" ]; then
+            [ "${GITHUB_REF_TYPE}" = "tag" ] || { echo "::error::publishing needs a tag — pick it in 'Use workflow from'"; exit 1; }
+          fi
+      - name: JS tests against what ships
+        working-directory: js
+        run: node --test
+      - name: Build the wheel and sdist
+        run: |
+          pip install build twine
+          python -m build python --outdir dist
+          twine check --strict dist/*
+      - name: The npm tarball holds only what package.json names
+        working-directory: js
+        run: npm pack --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+  testpypi:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'rehearsal'
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    if: (github.event_name == 'push' && vars.PYPI_ENABLED == 'true') || inputs.mode == 'pypi'
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  npm:
+    if: github.event_name == 'push' || inputs.mode == 'npm' || inputs.mode == 'rehearsal'
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: ${{ (github.event_name == 'push' || inputs.mode == 'npm') && 'npm' || 'npm-rehearsal' }}
+    permissions:
+      contents: read
+      id-token: write          # trusted publishing, and the provenance statement
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install -g npm@latest      # trusted publishing needs a current npm CLI
+      - name: Publish
+        working-directory: js
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.mode }}" = "npm" ]; then
+            if [ -n "$NPM_TOKEN" ]; then
+              echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+              echo "::warning::published with the temporary NPM_TOKEN — configure the trusted publisher and delete the secret"
+            fi
+            npm publish --provenance --access public
+          else
+            npm publish --dry-run --access public
+          fi
