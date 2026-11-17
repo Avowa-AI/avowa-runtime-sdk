@@ -51,6 +51,8 @@ def main(argv=None):
         loaded = load_env()
     except Exception:
         pass
+    from . import _apply_token
+    _apply_token()
 
     env = dict(os.environ)
     existing = env.get("PYTHONPATH")
@@ -68,8 +70,8 @@ def main(argv=None):
             "        Looked for AVOWA_RUNTIME_KEY in the environment, and for avowa.env / .env in\n"
             "        %s and its parents.\n"
             "        Fix (either one):\n"
-            "          • copy avowa.env from your SDK download into this directory, or\n"
-            "          • export AVOWA_RUNTIME_KEY=... AVOWA_RUNTIME_SECRET=...\n"
+            "          • run `avowa init <setup-token>` in this directory, or\n"
+            "          • export AVOWA_TOKEN=...\n"
             "        On macOS/Linux it must be `export VAR=value` — plain `set VAR=value` is\n"
             "        Windows CMD syntax and silently does nothing in bash/zsh.\n"
             % os.getcwd())
@@ -81,59 +83,10 @@ def main(argv=None):
         return 127
 
 
+def _init(args):
+    from .cli import init
+    return init(args)
+
+
 if __name__ == "__main__":
     sys.exit(main())
-
-
-def _init(args):
-    import json
-    import os
-    import stat
-    import urllib.request
-    if not args or args[0].startswith("-"):
-        sys.stderr.write("usage: avowa-run --init <setup-token> [--api https://api.avowa.ai]\n")
-        return 2
-    token = args[0]
-    api = (os.getenv("AVOWA_BASE_URL") or "https://api.avowa.ai").rstrip("/")
-    if "--api" in args:
-        api = args[args.index("--api") + 1].rstrip("/")
-    from . import _checked_base
-    api, problem = _checked_base(api)
-    if problem:
-        sys.stderr.write(problem.replace("AVOWA_BASE_URL", "--api") + ".\n")
-        return 2
-    req = urllib.request.Request(api + "/public/sdk/setup", data=json.dumps({"token": token}).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "User-Agent": "avowa-runtime-python (+https://avowa.ai)"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            creds = json.loads(r.read())
-    except Exception as e:
-        code = getattr(e, "code", None)
-        if code == 404:
-            sys.stderr.write("That setup token is invalid, expired (24h) or already used — generate a new one in the console.\n")
-        else:
-            sys.stderr.write("Could not reach %s (%s). Pass --api with your Avowa API URL.\n" % (api, e))
-        return 1
-    if creds.get("connector_id") != "runtime_sdk":
-        sys.stderr.write("That token belongs to a Collector connection, not the Runtime SDK — use avowa-collector.pyz init.\n")
-        return 1
-    base, problem = _checked_base(creds.get("base_url") or api)
-    if problem:
-        sys.stderr.write("The server returned an unsafe API URL (%s); nothing was written.\n" % problem)
-        return 1
-    path = os.path.join(os.getcwd(), "avowa.env")
-    text = ("# Avowa Runtime SDK — credentials for this connection. Keep private, server-side only.\n"
-            "# Written by `avowa-run --init`. The SDK reads this file from the directory you start your app from.\n"
-            "AVOWA_RUNTIME_KEY=%s\nAVOWA_RUNTIME_SECRET=%s\nAVOWA_BASE_URL=%s\n"
-            % (creds["ingest_token"], creds.get("ingest_secret") or "", base))
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    try:
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    print("✓ connected to %s (%s) · credentials in %s (0600)" % (creds.get("label") or "Avowa Runtime SDK", creds.get("environment", "prod"), path))
-    print("Next: start your app with `avowa-run <your usual command>` — then `avowa-run --doctor` to confirm the server sees it.")
-    return 0

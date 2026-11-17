@@ -19,9 +19,14 @@ function serve(status = 200) {
       body += c;
     });
     req.on('end', () => {
-      got.push({
+      const parsed = JSON.parse(body || '{}');
+      const events = Array.isArray(parsed.events) ? parsed.events : [parsed];
+      for (const ev of events) got.push({
         headers: req.headers,
-        body: JSON.parse(body || '{}')
+        body: ev,
+        envelope: parsed,
+        raw: body,
+        url: req.url
       });
       res.writeHead(status);
       res.end('{}');
@@ -530,7 +535,7 @@ test('https only — plain http only to a local or private host', () => {
   assert.equal(checkedBase('http://8.8.8.8')[0], null);
   assert.equal(checkedBase(undefined)[0], null);
 });
-test('every request carries a nonce inside its signature', async () => {
+test('every envelope carries a nonce inside its signed body, on the versioned route', async () => {
   const {
     srv,
     got,
@@ -548,9 +553,44 @@ test('every request carries a nonce inside its signature', async () => {
     model: 'm'
   });
   stop(srv);
-  const [a, b] = got.map(g => g.headers['x-avowa-nonce']);
+  assert.equal(got.length, 2);
+  const [a, b] = got.map(g => g.envelope.nonce);
   assert.match(a, /^[0-9a-f]{24}$/);
   assert.notEqual(a, b);
+  for (const g of got) {
+    assert.equal(g.url, '/ingest/v1');
+    assert.equal(g.envelope.schema, 'avowa.signal/1');
+    assert.deepEqual(g.envelope.source, {
+      kind: 'runtime',
+      client: 'avowa-runtime-js',
+      version: g.envelope.source.version
+    });
+    const {
+      createHmac
+    } = await import('node:crypto');
+    const want = createHmac('sha256', 's').update(`${g.headers['x-avowa-timestamp']}.${g.raw}`).digest('hex');
+    assert.equal(g.headers['x-avowa-signature'], want, 'signature covers "<ts>.<body>", nonce included');
+  }
+});
+test('calls captured together travel in one envelope, and each caller still learns it was delivered', async () => {
+  const {
+    srv,
+    got,
+    url
+  } = await serve();
+  const avowa = createAvowa({
+    ingestKey: 'k',
+    ingestSecret: 's',
+    baseUrl: url
+  });
+  const rs = await Promise.all([1, 2, 3].map(i => avowa.capture({
+    model: 'm' + i
+  })));
+  stop(srv);
+  assert.equal(got.length, 3);
+  assert.equal(new Set(got.map(g => g.envelope.nonce)).size, 1, 'one envelope');
+  assert.deepEqual(got.map(g => g.body.model).sort(), ['m1', 'm2', 'm3']);
+  for (const r of rs) assert.equal(r && r.status, 200);
 });
 test('the scan is bounded and linear', () => {
   const t = Date.now();
@@ -912,7 +952,7 @@ test('server-defined metadata fields: adopted only when the MAC verifies, read t
       body += c;
     });
     req.on('end', () => {
-      got.push(JSON.parse(body));
+      got.push(...(JSON.parse(body).events || []));
       held.push(req.headers['x-avowa-fields']);
       res.writeHead(200, {
         'Content-Type': 'application/json'
@@ -964,6 +1004,7 @@ test('server-defined metadata fields: adopted only when the MAC verifies, read t
     messages: []
   });
   await arrived(got, 2);
+  await new Promise(r => setTimeout(r, 100));
   stop(srv);
   assert.equal(held[0], 'none');
   assert.equal(held[1], 'v1');
@@ -991,7 +1032,7 @@ test('a metadata-field list that does not verify is ignored', async () => {
       body += c;
     });
     req.on('end', () => {
-      got.push(JSON.parse(body));
+      got.push(...(JSON.parse(body).events || []));
       held.push(req.headers['x-avowa-fields']);
       res.writeHead(200, {
         'Content-Type': 'application/json'

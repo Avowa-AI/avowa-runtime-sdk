@@ -28,7 +28,7 @@ builds it or when. Three ways to switch it on, cheapest first:
 
 All three end up in the same place. An auto-integration has nowhere to take arguments from, so
 configuration is AVOWA_RUNTIME_KEY / AVOWA_RUNTIME_SECRET / AVOWA_BASE_URL / AVOWA_REGION, read from
-the environment or from the `avowa.env` that came with your SDK download — put that file in the
+the environment or from the `avowa.env` that `avowa init` writes — put that file in the
 working directory and there is nothing to type. Real environment variables always win over the
 file. Set AVOWA_SCAN=0 to disable the local injection/PII scan.
 
@@ -149,13 +149,12 @@ def install():
     if _key() and not os.getenv("AVOWA_BASE_URL"):
         _warn_once("nobase",
                    "AVOWA_BASE_URL is not set, so no signals will be sent. It is already filled in "
-                   "inside the avowa.env written by `avowa-run --init`.")
+                   "inside the AVOWA_TOKEN that `avowa init` writes to avowa.env.")
     if not _key():
         _warn_once("noauth",
                    "auto-instrumentation is loaded, but no credentials were found, so no signals "
-                   "will be sent. Put avowa.env (from your SDK download) in the working directory, "
-                   "or export AVOWA_RUNTIME_KEY / AVOWA_RUNTIME_SECRET — on macOS/Linux `export`, "
-                   "not `set`.")
+                   "will be sent. Run `avowa init <setup-token>` in the working directory, "
+                   "or export AVOWA_TOKEN (on macOS/Linux `export`, not `set`).")
     runtime = AvowaRuntime()
 
     for name in ("anthropic", "openai"):
@@ -167,9 +166,11 @@ def install():
 
 
 _PTH_NAME = "avowa_auto.pth"
-_PTH_BODY = ("import os; exec(\"try:\\n import avowa_runtime.auto\\nexcept Exception:\\n pass\") "
-             "if os.environ.get('AVOWA_AUTO','').lower() in ('1','true','yes','on') "
-             "and os.environ.get('AVOWA_DISABLE','').lower() not in ('1','true','yes','on') else None\n")
+_PTH_BODY = ("import os; exec(\"try:\\n import avowa_runtime.hook\\nexcept Exception:\\n pass\") "
+             "if os.environ.get('AVOWA_DISABLE','').lower() not in ('1','true','yes','on') "
+             "and os.environ.get('AVOWA_AUTO','').lower() not in ('0','false','no','off') "
+             "and (os.environ.get('AVOWA_AUTO') or os.environ.get('AVOWA_TOKEN') or os.path.isfile('avowa.env')) "
+             "else None\n")
 
 
 def _pth_path():
@@ -201,6 +202,8 @@ def _main(argv):
         return 0
     from . import load_env, __version__
     found = load_env()
+    from . import _apply_token
+    _apply_token()
     if "--doctor" in argv:
         import json
         import time
@@ -314,14 +317,14 @@ def _main(argv):
     print("  patched    : " + (", ".join(instrumented) or "none (no provider SDK imported yet)"))
     print("  sdk        : avowa_runtime %s" % __version__)
     if not ok:
-        print("\n  No credentials, so nothing would be sent. Copy avowa.env from your SDK\n"
-              "  download into this directory, or `export AVOWA_RUNTIME_KEY=...` — note `export`,\n"
-              "  not `set`, which is Windows CMD syntax and does nothing in bash/zsh.")
+        print("\n  No credentials, so nothing would be sent. Run `avowa init <setup-token>` in this\n"
+              "  directory, or `export AVOWA_TOKEN=...` (`export`, not `set`, which is Windows CMD\n"
+              "  syntax and does nothing in bash/zsh).")
         return 1
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(_main(sys.argv[1:]))
-else:
+elif not getattr(sys.modules.get("avowa_runtime"), "_setup_tool", False):
     install()

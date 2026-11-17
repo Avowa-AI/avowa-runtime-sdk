@@ -1,6 +1,6 @@
 [project]
 name = "avowa-runtime"
-version = "0.11.0"
+version = "0.12.0"
 description = "Avowa Runtime SDK — emit live AI-inference signals to Avowa as evidence."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -19,6 +19,7 @@ classifiers = [
 
 
 [project.scripts]
+avowa = "avowa_runtime.cli:main"
 avowa-run = "avowa_runtime.run:main"
 
 [project.urls]

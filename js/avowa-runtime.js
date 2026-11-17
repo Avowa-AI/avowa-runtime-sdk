@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Avowa, Inc.
 const env = typeof process !== 'undefined' && process.env || {};
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
+const SCHEMA = 'avowa.signal/1';
+export const SDK_VERSION = VERSION;
 let _subtle = null;
 async function subtle() {
   if (_subtle) return _subtle;
@@ -185,6 +187,21 @@ export function hostOf(url) {
     return null;
   }
 }
+const TOKEN_PREFIX = 'avw1_';
+export function makeToken(key, secret, baseUrl) {
+  const raw = [key || '', secret || '', String(baseUrl || '').replace(/\/+$/, '')].join('\n');
+  return TOKEN_PREFIX + btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+export function readToken(token) {
+  token = String(token || '').trim();
+  if (!token.startsWith(TOKEN_PREFIX)) return null;
+  try {
+    const parts = atob(token.slice(TOKEN_PREFIX.length).replace(/-/g, '+').replace(/_/g, '/')).split('\n');
+    return parts.length === 3 && parts[0] ? parts : null;
+  } catch {
+    return null;
+  }
+}
 export function createAvowa({
   ingestKey,
   ingestSecret,
@@ -198,13 +215,16 @@ export function createAvowa({
       track: (meta, fn) => fn(),
       instrumentOpenAI: c => c,
       instrumentAnthropic: c => c,
+      _wrapResource: () => undefined,
       disabled: true
     };
   }
-  const key = ingestKey || env.AVOWA_RUNTIME_KEY;
-  const secret = ingestSecret || env.AVOWA_RUNTIME_SECRET;
-  const [base, baseProblem] = checkedBase(baseUrl || env.AVOWA_BASE_URL);
-  if (!key) warnOnce('nokey', 'no credentials — set AVOWA_RUNTIME_KEY / AVOWA_RUNTIME_SECRET (from your avowa.env) or pass ingestKey. No signals will be sent.');else if (baseProblem) warnOnce('nobase', `${baseProblem} — no signals will be sent. Your app is unaffected.`);
+  const tok = env.AVOWA_TOKEN ? readToken(env.AVOWA_TOKEN) : null;
+  if (env.AVOWA_TOKEN && !tok) warnOnce('token', 'AVOWA_TOKEN is set but is not a valid Avowa token (one starts with avw1_), so no signals will be sent. Copy it again from avowa.env or the console.');
+  const key = ingestKey || env.AVOWA_RUNTIME_KEY || tok && tok[0] || undefined;
+  const secret = ingestSecret || env.AVOWA_RUNTIME_SECRET || tok && tok[1] || undefined;
+  const [base, baseProblem] = checkedBase(baseUrl || env.AVOWA_BASE_URL || tok && tok[2] || undefined);
+  if (!key) warnOnce('nokey', 'no credentials. Set AVOWA_TOKEN (from `npx @avowa/runtime init`) or pass ingestKey. No signals will be sent.');else if (baseProblem) warnOnce('nobase', `${baseProblem} — no signals will be sent. Your app is unaffected.`);
   const MAX_INFLIGHT = 64;
   const TIMEOUT_MS = 5000;
   let inflight = 0;
@@ -253,7 +273,45 @@ export function createAvowa({
       payload.sdk_errors = kinds.reduce((n, k) => n + INTERNAL_ERRORS[k], 0);
       payload.sdk_error_kinds = kinds.sort().slice(0, 10);
     }
-    const body = JSON.stringify(payload);
+    return enqueue(payload);
+  }
+  const BATCH_MAX = 100;
+  const BATCH_WAIT_MS = 20;
+  let pending = [];
+  let pendingTimer = null;
+  function enqueue(payload) {
+    return new Promise((resolve, reject) => {
+      pending.push({
+        payload,
+        resolve,
+        reject
+      });
+      if (pending.length >= BATCH_MAX) flushPending();else if (!pendingTimer) pendingTimer = setTimeout(flushPending, BATCH_WAIT_MS);
+    });
+  }
+  function flushPending() {
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    const batch = pending.splice(0, BATCH_MAX);
+    if (pending.length) pendingTimer = setTimeout(flushPending, BATCH_WAIT_MS);
+    if (!batch.length) return;
+    sendEnvelope(batch.map(b => b.payload)).then(r => batch.forEach(b => b.resolve(r)), e => batch.forEach(b => b.reject(e)));
+  }
+  async function sendEnvelope(events) {
+    const nonce = [...(globalThis.crypto && globalThis.crypto.getRandomValues ? globalThis.crypto.getRandomValues(new Uint8Array(12)) : (await import('node:crypto')).randomBytes(12))].map(b => b.toString(16).padStart(2, '0')).join('');
+    const body = JSON.stringify({
+      schema: SCHEMA,
+      source: {
+        kind: 'runtime',
+        client: 'avowa-runtime-js',
+        version: VERSION
+      },
+      sent_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      nonce,
+      events
+    });
     const headers = {
       'Content-Type': 'application/json',
       'X-Ingest-Key': key,
@@ -261,14 +319,12 @@ export function createAvowa({
     };
     if (secret) {
       const ts = String(Math.floor(Date.now() / 1000));
-      const nonce = [...(globalThis.crypto && globalThis.crypto.getRandomValues ? globalThis.crypto.getRandomValues(new Uint8Array(12)) : (await import('node:crypto')).randomBytes(12))].map(b => b.toString(16).padStart(2, '0')).join('');
       headers['X-Avowa-Timestamp'] = ts;
-      headers['X-Avowa-Nonce'] = nonce;
-      headers['X-Avowa-Signature'] = await hmacHex(secret, `${ts}.${nonce}.${body}`);
+      headers['X-Avowa-Signature'] = await hmacHex(secret, `${ts}.${body}`);
       if (remoteOn()) headers['X-Avowa-Fields'] = REMOTE.v || 'none';
     }
     if (inflight >= MAX_INFLIGHT) {
-      warnOnce('inflight', `${MAX_INFLIGHT} signals already in flight — Avowa is slow or unreachable, so signals are being dropped. Your app is unaffected.`);
+      warnOnce('inflight', `${MAX_INFLIGHT} uploads already in flight — Avowa is slow or unreachable, so signals are being dropped. Your app is unaffected.`);
       return null;
     }
     inflight++;
@@ -276,7 +332,7 @@ export function createAvowa({
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
     if (timer && typeof timer.unref === 'function') timer.unref();
     try {
-      const r = await fetch(base + '/ingest/runtime', {
+      const r = await fetch(base + '/ingest/v1', {
         method: 'POST',
         headers,
         body,
@@ -287,7 +343,7 @@ export function createAvowa({
           const j = await r.clone().json();
           if (j && j.sdk_fields && secret && remoteOn()) await acceptFields(j.sdk_fields, secret);
           if (j && typeof j.sdk_latest === 'string' && /^\d+\.\d+\.\d+$/.test(j.sdk_latest)) {
-            warnOnce('latest', `@avowa/runtime ${j.sdk_latest} is available (this is ${VERSION}). Nothing is wrong — upgrade when convenient (your Avowa Connections page has the download).`);
+            warnOnce('latest', `@avowa/runtime ${j.sdk_latest} is available (this is ${VERSION}). Nothing is wrong — upgrade when convenient.`);
           }
         } catch {}
       }
@@ -661,9 +717,9 @@ export function createAvowa({
     } catch {}
     return stream;
   }
-  function wrapMethod(holder, name, kind, host, opts) {
+  function wrapMethod(holder, name, kind, host, opts, given) {
     if (typeof holder[name] !== 'function' || holder[name]._avowa_wrapped) return;
-    const original = holder[name].bind(holder);
+    const original = given || holder[name].bind(holder);
     const wrapped = function (params = {}, ...rest) {
       const start = Date.now();
       const emit = (resp, err, ttft) => {
@@ -757,11 +813,22 @@ export function createAvowa({
     if (client && client.messages) wrapMethod(client.messages, 'create', 'anthropic', host, opts);
     return client;
   }
+  function _wrapResource(resource, name, kind, original) {
+    const client = resource && resource._client;
+    const host = hostOf(client && client.baseURL) || (kind === 'anthropic' ? 'api.anthropic.com' : 'api.openai.com');
+    const scan = !['0', 'false', 'no', 'off'].includes(String(env.AVOWA_SCAN || '').trim().toLowerCase());
+    wrapMethod(resource, name, kind, host, {
+      clientFacts: clientFacts(client),
+      scan,
+      region
+    }, original.bind(resource));
+  }
   return {
     capture,
     track,
     instrumentOpenAI,
-    instrumentAnthropic
+    instrumentAnthropic,
+    _wrapResource
   };
 }
 export default createAvowa;

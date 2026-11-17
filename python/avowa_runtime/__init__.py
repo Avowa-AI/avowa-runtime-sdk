@@ -39,7 +39,7 @@ import urllib.request
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 __all__ = ["AvowaRuntime"]
 
 
@@ -71,6 +71,60 @@ _TRUE = ("1", "true", "yes", "on")
 
 def _disabled():
     return os.getenv("AVOWA_DISABLE", "").strip().lower() in _TRUE
+
+
+_TOKEN_PREFIX = "avw1_"
+_TOKEN_VARS = ("AVOWA_RUNTIME_KEY", "AVOWA_RUNTIME_SECRET", "AVOWA_BASE_URL")
+
+
+def make_token(key, secret, base_url):
+    """Pack a connection's key, signing secret and API URL into one AVOWA_TOKEN value."""
+    import base64
+    raw = "\n".join((key or "", secret or "", (base_url or "").rstrip("/")))
+    return _TOKEN_PREFIX + base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def read_token(token):
+    """(key, secret, base_url) from an AVOWA_TOKEN value, or None when it is not one."""
+    import base64
+    token = (token or "").strip()
+    if not token.startswith(_TOKEN_PREFIX):
+        return None
+    body = token[len(_TOKEN_PREFIX):]
+    try:
+        parts = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode().split("\n")
+    except Exception:
+        return None
+    if len(parts) != 3 or not parts[0]:
+        return None
+    return tuple(parts)
+
+
+def _apply_token():
+    token = os.getenv("AVOWA_TOKEN")
+    if not token:
+        return False
+    parts = read_token(token)
+    if not parts:
+        _warn_once("token", "AVOWA_TOKEN is set but is not a valid Avowa token (one starts with "
+                            "avw1_), so no signals will be sent. Copy it again from avowa.env or the console.")
+        return False
+    for name, value in zip(_TOKEN_VARS, parts):
+        if value:
+            os.environ.setdefault(name, value)
+    return True
+
+
+def auto_wanted():
+    """Should the start-up hook instrument this process? AVOWA_AUTO decides when it is set; when it
+    is not, having a token (in the environment or in avowa.env) is the opt-in. Installing the
+    package alone never switches anything on."""
+    if _disabled():
+        return False
+    flag = os.getenv("AVOWA_AUTO", "").strip().lower()
+    if flag:
+        return flag in _TRUE
+    return bool(os.getenv("AVOWA_TOKEN"))
 
 
 def _private_host(host):
@@ -204,14 +258,17 @@ def scan_injection(text):
     return len(injection_families(text))
 
 
+_SCHEMA = "avowa.signal/1"
+_BATCH_MAX = 100
+
 _ENV_NAMES = ("avowa.env", ".env")
 _env_loaded = False
 
 
 def load_env(path=None, _search_up=3):
-    """Fill in missing AVOWA_* variables from the `avowa.env` shipped in your SDK download.
+    """Fill in missing AVOWA_* variables from the `avowa.env` that `avowa init` writes.
 
-    The zip arrives with your keys already in it, so requiring people to re-type them into the
+    The file already holds the credential, so requiring people to re-type it into the
     shell is a step that buys nothing — and it is the step where integrations die (`set` instead
     of `export`, a var exported in one terminal and the app started in another, a Compose file
     that never passed it through).
@@ -269,13 +326,15 @@ def load_env(path=None, _search_up=3):
 
 def _autoload_env():
     global _env_loaded
+    found = None
     if not _env_loaded:
         _env_loaded = True
         try:
-            return load_env()
+            found = load_env()
         except Exception:
-            return None
-    return None
+            found = None
+    _apply_token()
+    return found
 
 
 _warned = set()
@@ -1547,31 +1606,51 @@ class AvowaRuntime:
     def _run(self):
         while True:
             item = self._q.get()
+            batch, stop = [item], item is None
+            while not stop and len(batch) < _BATCH_MAX:
+                try:
+                    nxt = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                batch.append(nxt)
+                stop = nxt is None
             try:
-                if item is None:
-                    return
-                evt, scan = item
-                _apply_scan(evt, scan)
-                self._post(evt)
+                events = []
+                for it in batch:
+                    if it is None:
+                        continue
+                    evt, scan = it
+                    _apply_scan(evt, scan)
+                    events.append(evt)
+                if events:
+                    self._post_many(events)
             except Exception as e:
                 _internal_error("sender", e, fatal_in_strict=False)
             finally:
-                self._q.task_done()
+                for _ in batch:
+                    self._q.task_done()
+            if stop:
+                return
 
     def _post(self, evt):
-        body = json.dumps(evt, separators=(",", ":"))
+        self._post_many([evt])
+
+    def _post_many(self, events):
+        envelope = {"schema": _SCHEMA, "source": {"kind": "runtime", "client": "avowa-runtime-python",
+                                                  "version": __version__},
+                    "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "nonce": os.urandom(12).hex(), "events": list(events)}
+        body = json.dumps(envelope, separators=(",", ":"))
         headers = {"Content-Type": "application/json", "X-Ingest-Key": self.key,
                    "User-Agent": f"avowa-runtime-python/{__version__} (+https://avowa.ai)"}
         if self.secret:
             ts = str(int(time.time()))
-            nonce = os.urandom(12).hex()
-            sig = hmac.new(self.secret.encode(), f"{ts}.{nonce}.{body}".encode(), hashlib.sha256).hexdigest()
+            sig = hmac.new(self.secret.encode(), f"{ts}.{body}".encode(), hashlib.sha256).hexdigest()
             headers["X-Avowa-Timestamp"] = ts
-            headers["X-Avowa-Nonce"] = nonce
             headers["X-Avowa-Signature"] = sig
         if self.secret and _remote_on():
             headers["X-Avowa-Fields"] = _REMOTE["v"] or "none"
-        url = self.base + "/ingest/runtime"
+        url = self.base + "/ingest/v1"
         req = urllib.request.Request(url, data=body.encode(), method="POST", headers=headers)
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout)
@@ -1590,14 +1669,15 @@ class AvowaRuntime:
                 if isinstance(latest, str) and re.match(r"^\d+\.\d+\.\d+$", latest):
                     _warn_once("latest", "avowa_runtime %s is available (this is %s). Nothing is wrong — "
                                          "upgrade when convenient (your Avowa Connections page has the download)." % (latest, __version__))
-            _dbg("sent %s → HTTP %s" % (_evt_summary(evt), getattr(resp, "status", None) or resp.getcode()))
+            what = _evt_summary(events[0]) if len(events) == 1 else "%d events" % len(events)
+            _dbg("sent %s → HTTP %s" % (what, getattr(resp, "status", None) or resp.getcode()))
         except Exception as e:
             detail = type(e).__name__
             code = getattr(e, "code", None)
             if code:
                 hint = {401: "the ingest key or secret is wrong for this connection",
                         403: "this key is not permitted to write signals",
-                        404: "no /ingest/runtime at this AVOWA_BASE_URL — check the URL",
+                        404: "no /ingest/v1 at this AVOWA_BASE_URL — check the URL",
                         422: "the server rejected the signal's shape"}.get(
                             code, "the server rejected the signal")
                 if code == 401 and self.secret:
@@ -1610,4 +1690,3 @@ class AvowaRuntime:
                        "signal NOT delivered: %s. Your app is unaffected; evidence is not being "
                        "recorded. Set AVOWA_DEBUG=1 for per-call detail." % detail)
             _dbg("POST %s failed: %r" % (url, e))
-            raise

@@ -1,0 +1,1 @@
+import os; exec("try:\n import avowa_runtime.hook\nexcept Exception:\n pass") if os.environ.get('AVOWA_DISABLE','').lower() not in ('1','true','yes','on') and os.environ.get('AVOWA_AUTO','').lower() not in ('0','false','no','off') and (os.environ.get('AVOWA_AUTO') or os.environ.get('AVOWA_TOKEN') or os.path.isfile('avowa.env')) else None

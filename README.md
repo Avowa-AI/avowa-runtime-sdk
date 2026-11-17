@@ -11,24 +11,26 @@ It is open source because it runs in your production system. You should be able 
 that does, and your security reviewer should be able to check the claim below for themselves rather
 than take our word for it.
 
-```python
-pip install avowa-runtime            # or the signed zip from your Avowa console
+Two lines, and your code and start command stay as they are:
 
-import avowa_runtime as avowa
-client = avowa.instrument_anthropic(anthropic.Anthropic(), region="us-east-1")
-# every call is now captured — no further code changes
+```bash
+pip install avowa-runtime                 # Python
+avowa init <setup-token>
 ```
 
-```js
-import createAvowa from '@avowa/runtime'
-const avowa = createAvowa({ ingestKey: process.env.AVOWA_RUNTIME_KEY, region: 'us-east-1' })
-await avowa.track({ model: 'claude-opus-4-8' }, () => client.messages.create(...))
+```bash
+npm install @avowa/runtime                # Node.js
+npx @avowa/runtime init <setup-token>
 ```
 
-- **[`python/`](python/)** — the Python SDK: explicit capture, client instrumentation for the
-  `anthropic` and `openai` libraries, and a zero-code-change mode (`AVOWA_AUTO=1`).
+Then start your app the way you always do. In production it is one variable, `AVOWA_TOKEN`.
+`AVOWA_DISABLE=1` switches everything off.
+
+- **[`python/`](python/)** — the Python SDK: a start-up hook that covers the `anthropic` and `openai`
+  libraries with no code or start-command change, client wrappers, and explicit capture.
 - **[`js/`](js/)** — the JavaScript/TypeScript SDK for Node 18+, server-side only (the signing
-  secret must never reach a browser).
+  secret must never reach a browser): a preload that covers `openai` and `@anthropic-ai/sdk`
+  with no code change, client wrappers, and explicit capture.
 
 ## What it sends, and what it never sends
 

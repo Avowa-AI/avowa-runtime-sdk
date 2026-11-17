@@ -10,32 +10,41 @@ can't capture: *how your AI actually behaves in production.*
 
 ## Install
 
-**Fastest path — three lines, in the environment your app runs in** (Connections → Runtime SDK → *Generate setup token*):
+**Two lines, in the environment your app runs in.** Your code and your start command stay as they
+are. (The setup token comes from Connections → Runtime SDK → *Generate setup token*.)
 
 ```bash
-pip install https://api.avowa.ai/public/sdk/avowa-runtime-sdk.zip      # public, code only (PyPI follows)
-avowa-run --init <setup-token> --api https://api.avowa.ai              # writes avowa.env (0600); nothing to paste
-avowa-run <your usual start command>                                   # auto-instrumented, no code change
+pip install avowa-runtime        # standard library only, nothing else is installed
+avowa init <setup-token>         # writes avowa.env with one value: AVOWA_TOKEN
 ```
 
-`avowa-run --doctor` then confirms the key, the secret and your clock without sending anything.
+Then start your app the way you always do and send one real request that calls the model.
 
-```bash
-pip install ./sdk/python          # local
-# (not on PyPI yet — install from the zip your Avowa console hands you)
-```
+- `avowa init --dry-run` shows what init would do and changes nothing.
+- `avowa status` shows what is covered and asks the server whether it knows this key. It sends no signal.
+- **In production** put one variable in your secret store: `AVOWA_TOKEN` (the value in `avowa.env`). Nothing else changes: not the Dockerfile `CMD`, not the code.
+- `AVOWA_DISABLE=1` switches everything off.
+
+How it works: the package installs a small start-up hook (`avowa_auto.pth`). The hook does nothing
+unless the process has opted in, which means `AVOWA_TOKEN` is set, or an `avowa.env` is in the
+directory the process starts from, or `AVOWA_AUTO=1`. Installing the package alone never switches
+anything on, and `pip uninstall avowa-runtime` removes the hook.
+
+No route to PyPI? Mirror `avowa-runtime` through your own index like any other dependency: it is
+pure Python with no dependencies of its own. From a checkout of this repository it is
+`pip install ./python`.
 
 ## Configure
-Get the **ingest key** and **signing secret** from Avowa → **Connections → Avowa Runtime
-SDK** (both are minted when you enable that connector). Then set env vars (or pass them to
-the constructor):
+`avowa init` does this for you. By hand, it is one variable (or the same line in `avowa.env`):
 
 ```bash
-export AVOWA_RUNTIME_KEY="..."                # identifies your connection (from your avowa.env)
-export AVOWA_RUNTIME_SECRET="avs_..."         # signs each signal (tamper-evident)
-export AVOWA_BASE_URL="https://api.your-avowa.com"   # required — no default; https only
-export AVOWA_REGION="us-east-1"
+export AVOWA_TOKEN="avw1_..."        # the connection's key, signing secret and API URL in one value
+export AVOWA_REGION="us-east-1"      # optional
 ```
+
+The three separate variables the token replaces still work, and one that is set wins over the
+token: `AVOWA_RUNTIME_KEY`, `AVOWA_RUNTIME_SECRET`, `AVOWA_BASE_URL`. With those instead of a
+token, set `AVOWA_AUTO=1` to switch the start-up hook on.
 
 > **Tamper-evident and single-use (0.9+):** every request is HMAC-SHA256-signed over
 > `"<unix-timestamp>.<nonce>.<body>"` (headers `X-Avowa-Timestamp` / `X-Avowa-Nonce` /
@@ -86,21 +95,20 @@ rather than a missed integration, because Avowa publishes instrumentation covera
 denominator. Auto-instrumentation patches the client **classes**, so every instance is covered
 no matter who builds it.
 
-**Credentials first, and there is nothing to type.** Your SDK download contains `avowa.env`
-already filled in — copy it into the directory you start your app from. The SDK reads **only
+**Credentials first, and there is nothing to type.** `avowa init` writes `avowa.env` into the
+directory you start your app from. The SDK reads **only
 `AVOWA_*` keys** out of it and a real environment variable **always wins**, so Kubernetes Secrets
 or Secrets Manager injection keeps working unchanged. (`AVOWA_ENV_FILE` points at a specific file;
 `AVOWA_NO_ENV_FILE=1` switches it off.) Setting them by hand on macOS/Linux is `export VAR=value` —
 plain `set VAR=value` is Windows CMD syntax and silently does nothing in bash/zsh.
 
 ```bash
-# 1. Prefix how the process starts — nothing in your app changes. Best option for most teams.
-avowa-run uvicorn app:main --host 0.0.0.0
-avowa-run gunicorn -w 4 app:main
-# Docker:  CMD ["avowa-run", "uvicorn", "app:main"]
+# 1. Nothing. With a token in place the start-up hook covers the app as it starts:
+uvicorn app:main --host 0.0.0.0
+gunicorn -w 4 app:main
 
-# 2. Can't change the start command? Install a start-up hook once per environment.
-python -m avowa_runtime.auto --install     # then set AVOWA_AUTO=1  (--uninstall to remove)
+# 2. One process only, without the hook: prefix its command.
+avowa run uvicorn app:main --host 0.0.0.0      # `avowa-run <command>` is the same, older name
 
 # 3. See what it patched.
 python -m avowa_runtime.auto
@@ -111,13 +119,13 @@ python -m avowa_runtime.auto
 import avowa_runtime.auto
 ```
 
-All four read config from the environment only: `AVOWA_RUNTIME_KEY`, `AVOWA_RUNTIME_SECRET`,
-`AVOWA_BASE_URL`, `AVOWA_REGION`, and `AVOWA_SCAN=0` to disable the local scan. Import order
+All of them read config from the environment only: `AVOWA_TOKEN`, `AVOWA_REGION`, and
+`AVOWA_SCAN=0` to disable the local scan. Import order
 doesn't matter — an import hook patches provider SDKs whenever they load. Gunicorn/uvicorn
 workers inherit the environment, so workers are instrumented and Avowa sums their signals.
 
-The `.pth` hook does nothing at all unless `AVOWA_AUTO=1`, so installing the SDK can never
-silently start instrumenting something.
+The start-up hook does nothing at all without a token (or `AVOWA_AUTO=1`), so installing the SDK
+can never silently start instrumenting something. `AVOWA_AUTO=0` keeps it off even with a token.
 
 ### Nothing showing up?
 
@@ -125,7 +133,7 @@ silently start instrumenting something.
 python -m avowa_runtime.auto --check       # credentials + reachability. Sends NO signal:
                                            # a synthetic event would show on your trust
                                            # profile as inference that never happened.
-AVOWA_DEBUG=1 avowa-run <your command>     # trace patch → capture → send, metadata only
+AVOWA_DEBUG=1 <your usual start command>   # trace patch → capture → send, metadata only
 ```
 
 ```
