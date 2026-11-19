@@ -87,6 +87,33 @@ request signed and single-use, and `AVOWA_DISABLE=1` turns it off entirely.
 
 Licence: Apache-2.0.
 
+## Agents: approvals, outcomes and who ran it (0.13)
+
+The wrappers read each tool call the model proposed and each result your app handed back, by a hash
+of the provider's call id (the id never leaves your process), plus the run key and step depth, the
+same as the Python SDK. A human approval or a tool's outcome happens after the call, so record it on
+its own:
+
+```js
+import { approval, toolOutcome, agentContext } from '@avowa/runtime'
+
+await agentContext({ name: 'triage', customer: account.id }, async () => {
+  const resp = await client.messages.create({ ... })
+  for (const b of resp.content) {
+    if (b.type === 'tool_use' && needsSignOff(b)) {
+      approval(b.id, await askAHuman(b), 'finance_ops', { approverType: 'human' })   // a role label, never a name
+      toolOutcome(b.id, 'ok')                             // or 'error', 'denied', 'timeout'
+    }
+  }
+})
+```
+
+`approverType` is `'human'`, `'policy'` (with `policyRef`), `'system'` or `'unknown'` (the default); only
+`'human'` counts as human approval, and Avowa does not claim the decision came before the tool ran.
+Call references are 20 hex characters of a hash of the provider's id: a correlation label, not
+anonymisation. The customer id is sent only as a keyed hash; set `AVOWA_REF_KEY` (read only in your
+process, never sent) and nobody else can test a guess. Rotating it starts a new correlation period.
+
 ## Wrap your client (observed, not asserted)
 
 ```js

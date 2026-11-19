@@ -229,6 +229,47 @@ suppress it. Where a signal blends several fields (guardrails combines your guar
 counts with the block outcome) it stays as strong as its weakest field, so every call must be
 observed for it to be graded observed.
 
+**Since 0.13, each tool call is tracked by reference, and approvals join the right call.**
+
+| Field | How it is derived |
+|---|---|
+| `tool_calls` | each call the model proposed, as `<ref>:<tool>`. `ref` is 20 hex characters of a hash of the provider's id (`toolu_…`, `call_…`); the id itself never leaves your process. It is a correlation label, not anonymisation: anyone with the id can compute it |
+| `tool_results` | each result your app handed back to the model on the next call, as `<ref>:returned` or `<ref>:error` (`error` only where your app flagged it, such as Anthropic `is_error`) |
+| `mcp_servers_offered`, `mcp_hosts`, `mcp_tools_invoked` | hosted MCP servers handed to the provider (labels and hostnames only) and the MCP tools it ran there |
+
+A human approval, or how a tool call ended, happens after the model call that proposed it, so you
+record it on its own. Pass the provider's id; only its hash is sent:
+
+```python
+import avowa_runtime
+
+for block in resp.content:
+    if block.type == "tool_use" and needs_sign_off(block):
+        ok = ask_a_human(block)
+        avowa_runtime.approval(block.id, approved=ok, approver_role="finance_ops", approver_type="human")
+        ...
+        avowa_runtime.tool_outcome(block.id, "ok")      # or "error", "denied", "timeout"
+```
+
+`approver_type` says who decided: `"human"`, `"policy"` (pass `policy_ref="refunds-under-100"`),
+`"system"`, or `"unknown"` (the default). Only `"human"` counts as human approval; a policy or system
+authorisation is counted separately. `approver_role` is a short label, never a person's name. The
+human-approval claim is then counted per consequential call, from what your app reported. Avowa does
+not see the decision and does not claim it came before the tool ran.
+
+Which agent ran, and for which of **your** customers:
+
+```python
+with avowa_runtime.agent_context("triage", customer=account.id):
+    run_agent(...)
+```
+
+The name is sent as written; the customer id is sent only as a keyed hash. Set `AVOWA_REF_KEY` to a
+secret of your own (it is read only inside your process and never sent) and nobody, Avowa included,
+can test a guessed customer id against it. Rotating that key starts a new correlation period: the
+same customer gets a new reference from then on. Avowa never holds a mapping back to your customers.
+A run whose calls carry two different customers is shown to you as a finding.
+
 `action_class` (read / write / external / financial) is **not** derived. The SDK sees a tool's name,
 not its consequence, and guessing would put a judgement in your mouth — pass it explicitly if you
 want human-approval coverage measured over consequential actions only.

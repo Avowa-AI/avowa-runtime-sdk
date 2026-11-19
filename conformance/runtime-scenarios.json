@@ -1,6 +1,6 @@
 {
   "contract": "avowa.signal/1",
-  "about": "One provider call per scenario, and the runtime event every Avowa collector must produce from it. Run by the Python SDK tests (backend/test_evidence_contract.py), the Node SDK tests (sdk/js/conformance.test.mjs) and, for the facts OpenTelemetry carries, the OTel parser. A collector for another language is done when it passes this file. Text marked SECRET must never appear in an event.",
+  "about": "One provider call per scenario, and the runtime event every Avowa collector must produce from it. Run by the Python SDK tests (backend/test_evidence_contract.py), the Node SDK tests (sdk/js/conformance.test.mjs) and, for the facts OpenTelemetry carries, the OTel parser. A collector for another language is done when it passes this file. Text marked SECRET must never appear in an event. Tool-call ids appear only as 20-hex `call_ref` hashes; the expected run key assumes the connection secret \"s\".",
   "scenarios": [
     {
       "name": "anthropic messages, plain answer",
@@ -96,6 +96,37 @@
       "otel": {"attributes": {"gen_ai.provider.name": "anthropic", "gen_ai.request.model": "claude-opus-4-8",
                               "server.address": "api.anthropic.com", "error.type": "RateLimitError"},
                "expect_event": {"error": "RateLimitError", "endpoint": "api.anthropic.com"}}
+    },
+    {
+      "name": "anthropic messages, a tool result comes back flagged as an error and the model proposes the next call",
+      "provider": "anthropic",
+      "api": "messages",
+      "base_url": "https://api.anthropic.com",
+      "request": {"model": "claude-opus-4-8", "max_tokens": 256, "tools": [{"name": "lookup_invoice"}, {"name": "issue_refund"}], "messages": [{"role": "user", "content": "SECRET-PROMPT find invoice 42"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup_invoice", "input": {"id": "SECRET-ARG"}}]}, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "SECRET-RESULT"}]}]},
+      "response": {"model": "claude-opus-4-8", "stop_reason": "tool_use", "usage": {"input_tokens": 40, "output_tokens": 6}, "content": [{"type": "tool_use", "id": "toolu_2", "name": "issue_refund", "input": {"amount": "SECRET-ARG"}}]},
+      "expect": {"tool_calls": ["82bc55eb98715b9e1497:issue_refund"], "tool_results": ["9613eff30344a1259020:error"], "autonomy_depth": 1, "agent_run_key": "643f764560e8", "tools_invoked": ["issue_refund"]},
+      "observed": ["tool_calls", "tool_results", "autonomy_depth", "agent_run_key"],
+      "graded": {"agent_run": true, "tool_called": "issue_refund"}
+    },
+    {
+      "name": "openai chat, the tool result is handed back and the model proposes the next call",
+      "provider": "openai",
+      "api": "chat",
+      "base_url": "https://api.openai.com/v1",
+      "request": {"model": "gpt-4o-2024-08-06", "max_tokens": 64, "tools": [{"type": "function", "function": {"name": "lookup_invoice"}}], "messages": [{"role": "user", "content": "SECRET-PROMPT find invoice 42"}, {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup_invoice", "arguments": "{\"id\":\"SECRET-ARG\"}"}}]}, {"role": "tool", "tool_call_id": "call_1", "content": "SECRET-RESULT"}]},
+      "response": {"model": "gpt-4o-2024-08-06", "choices": [{"finish_reason": "tool_calls", "message": {"content": null, "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "lookup_invoice", "arguments": "{\"id\":\"SECRET-ARG\"}"}}]}}], "usage": {"prompt_tokens": 30, "completion_tokens": 7}},
+      "expect": {"tool_calls": ["c9dd57b7d0dd96f3b4d5:lookup_invoice"], "tool_results": ["a6c3f44ac7065cf88573:returned"], "autonomy_depth": 1, "agent_run_key": "643f764560e8"},
+      "observed": ["tool_calls", "tool_results", "autonomy_depth", "agent_run_key"]
+    },
+    {
+      "name": "openai responses api, a hosted MCP server and a function call",
+      "provider": "openai",
+      "api": "responses",
+      "base_url": "https://api.openai.com/v1",
+      "request": {"model": "gpt-4o-2024-08-06", "max_output_tokens": 100, "tools": [{"type": "mcp", "server_label": "github", "server_url": "https://mcp.github.example/sse?token=SECRET-TOKEN"}, {"type": "function", "name": "lookup"}], "input": [{"role": "user", "content": "SECRET-PROMPT open an issue"}, {"type": "function_call", "call_id": "call_7", "name": "lookup", "arguments": "SECRET-ARG"}, {"type": "function_call_output", "call_id": "call_7", "output": "SECRET-RESULT"}]},
+      "response": {"model": "gpt-4o-2024-08-06", "status": "completed", "incomplete_details": null, "usage": {"input_tokens": 20, "output_tokens": 5}, "output": [{"type": "mcp_call", "server_label": "github", "name": "create_issue", "arguments": "SECRET-ARG", "output": "SECRET-RESULT"}, {"type": "function_call", "call_id": "call_8", "name": "lookup", "arguments": "{}"}]},
+      "expect": {"mcp_servers_offered": ["github"], "mcp_hosts": ["mcp.github.example"], "mcp_tools_invoked": ["github/create_issue"], "mcp_hosts_invoked": ["mcp.github.example"], "tool_calls": ["0be4045f4172a4a0456c:lookup"], "tool_results": ["dae877d3a915dd392144:returned"], "tools_offered": ["lookup"]},
+      "observed": ["mcp_servers_offered", "mcp_hosts", "mcp_tools_invoked", "mcp_hosts_invoked", "tool_calls", "tool_results"]
     }
   ]
 }

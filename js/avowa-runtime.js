@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Avowa, Inc.
+import { createHash, createHmac } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 const env = typeof process !== 'undefined' && process.env || {};
-const VERSION = '0.12.0';
+const VERSION = '0.13.0';
 const SCHEMA = 'avowa.signal/1';
 export const SDK_VERSION = VERSION;
 let _subtle = null;
@@ -202,6 +204,160 @@ export function readToken(token) {
     return null;
   }
 }
+export const TOOL_OUTCOMES = ['ok', 'error', 'denied', 'timeout'];
+export const APPROVER_TYPES = ['human', 'policy', 'system', 'unknown'];
+const CALL_REF_LEN = 20;
+const TOOL_CAP = 60;
+const LABEL_RX = /^[A-Za-z0-9 _.:/-]{1,64}$/;
+export function callRef(id) {
+  if (id === undefined || id === null || id === '') return null;
+  return createHash('sha256').update('avowa-call:' + String(id)).digest('hex').slice(0, CALL_REF_LEN);
+}
+const g = (o, k) => o === null || o === undefined ? undefined : o[k];
+function toolCalls(resp) {
+  const out = [];
+  const add = (id, name) => {
+    const r = callRef(id);
+    if (r && name) out.push(r + ':' + String(name).slice(0, 64));
+  };
+  try {
+    for (const b of g(resp, 'content') || []) if (g(b, 'type') === 'tool_use') add(g(b, 'id'), g(b, 'name'));
+    const msg = g(g(g(resp, 'choices'), 0), 'message');
+    for (const tc of g(msg, 'tool_calls') || []) add(g(tc, 'id'), g(g(tc, 'function'), 'name') || g(tc, 'name'));
+    for (const it of Array.isArray(g(resp, 'output')) ? resp.output : []) {
+      if (['function_call', 'custom_tool_call'].includes(g(it, 'type'))) add(g(it, 'call_id') || g(it, 'id'), g(it, 'name'));
+    }
+  } catch {}
+  return out.slice(0, TOOL_CAP);
+}
+function toolResults(history) {
+  if (!Array.isArray(history)) return [];
+  let fresh = [];
+  for (const m of history) {
+    const role = g(m, 'role'),
+      typ = g(m, 'type');
+    if (role === 'assistant' || typ === 'function_call' || typ === 'custom_tool_call') {
+      fresh = [];
+      continue;
+    }
+    if (role === 'tool') {
+      const r = callRef(g(m, 'tool_call_id'));
+      if (r) fresh.push(r + ':returned');
+      continue;
+    }
+    if (typ === 'function_call_output' || typ === 'custom_tool_call_output') {
+      const r = callRef(g(m, 'call_id'));
+      if (r) fresh.push(r + ':returned');
+      continue;
+    }
+    const c = g(m, 'content');
+    if (Array.isArray(c)) {
+      for (const b of c) {
+        if (g(b, 'type') === 'tool_result') {
+          const r = callRef(g(b, 'tool_use_id'));
+          if (r) fresh.push(r + (g(b, 'is_error') === true ? ':error' : ':returned'));
+        }
+      }
+    }
+  }
+  return fresh.slice(0, TOOL_CAP);
+}
+function mcpFacts(params, resp) {
+  const f = {},
+    labels = [],
+    hosts = [],
+    ran = [],
+    hostOfLabel = {};
+  const note = (lb, h) => {
+    if (lb) labels.push(String(lb).slice(0, 64));
+    if (h) {
+      hosts.push(h);
+      if (lb) hostOfLabel[String(lb).slice(0, 64)] = h;
+    }
+  };
+  try {
+    for (const s of g(params, 'mcp_servers') || []) note(g(s, 'name'), hostOf(g(s, 'url')));
+    for (const t of g(params, 'tools') || []) {
+      if (g(t, 'type') === 'mcp') note(g(t, 'server_label'), hostOf(g(t, 'server_url')));
+    }
+    for (const b of g(resp, 'content') || []) {
+      if (g(b, 'type') === 'mcp_tool_use' && g(b, 'name')) ran.push(String(g(b, 'server_name') || '?').slice(0, 64) + '/' + String(b.name).slice(0, 64));
+    }
+    for (const it of Array.isArray(g(resp, 'output')) ? resp.output : []) {
+      if (g(it, 'type') === 'mcp_call' && g(it, 'name')) ran.push(String(g(it, 'server_label') || '?').slice(0, 64) + '/' + String(it.name).slice(0, 64));
+    }
+  } catch {}
+  const uniq = a => [...new Set(a)].sort().slice(0, TOOL_CAP);
+  if (labels.length) f.mcp_servers_offered = uniq(labels);
+  if (hosts.length) f.mcp_hosts = uniq(hosts);
+  if (labels.length || ran.length) {
+    f.mcp_tools_invoked = uniq(ran);
+    f.mcp_hosts_invoked = uniq(ran.map(r => hostOfLabel[r.split('/')[0]]).filter(Boolean));
+  }
+  return f;
+}
+function runKey(messages, secret) {
+  if (!Array.isArray(messages)) return null;
+  for (const m of messages) {
+    if (g(m, 'role') !== 'user') continue;
+    let c = g(m, 'content');
+    if (Array.isArray(c)) c = c.map(b => b && typeof b === 'object' ? String(b.text || b.content || '') : '').join('');
+    c = String(c || '').trim();
+    if (!c) continue;
+    return (secret ? createHmac('sha256', String(secret)).update(c) : createHash('sha256').update(c)).digest('hex').slice(0, 12);
+  }
+  return null;
+}
+function autonomyDepth(messages) {
+  if (!Array.isArray(messages)) return null;
+  let d = 0;
+  for (const m of messages) {
+    if (g(m, 'role') !== 'assistant') continue;
+    if (Array.isArray(g(m, 'tool_calls')) && m.tool_calls.length) {
+      d++;
+      continue;
+    }
+    const c = g(m, 'content');
+    if (Array.isArray(c) && c.some(b => g(b, 'type') === 'tool_use')) d++;
+  }
+  return d;
+}
+const AGENT = new AsyncLocalStorage();
+export function agentContext({
+  name,
+  customer
+} = {}, fn) {
+  let nm = name === undefined || name === null ? null : String(name).slice(0, 64);
+  if (nm !== null && !LABEL_RX.test(nm)) {
+    warnOnce('agentname', 'agentContext name must be letters, digits and _ . : / - (64 at most); the name was not recorded.');
+    nm = null;
+  }
+  return AGENT.run({
+    name: nm,
+    customer: customer === undefined || customer === null ? null : String(customer)
+  }, fn);
+}
+function customerRef(secret, customer) {
+  if (customer === undefined || customer === null || customer === '') return null;
+  const key = env.AVOWA_REF_KEY || secret;
+  if (!key) return null;
+  return createHmac('sha256', String(key)).update('avowa-customer:' + String(customer)).digest('hex').slice(0, 12);
+}
+let DEFAULT = null;
+export function approval(callId, approved, approverRole, opts = {}) {
+  if (!DEFAULT) {
+    warnOnce('noruntime', 'approval() was called but no Avowa runtime is running; nothing was recorded.');
+    return Promise.resolve(null);
+  }
+  return DEFAULT.approval(callId, approved, approverRole, opts);
+}
+export function toolOutcome(callId, outcome) {
+  if (!DEFAULT) {
+    warnOnce('noruntime', 'toolOutcome() was called but no Avowa runtime is running; nothing was recorded.');
+    return Promise.resolve(null);
+  }
+  return DEFAULT.toolOutcome(callId, outcome);
+}
 export function createAvowa({
   ingestKey,
   ingestSecret,
@@ -216,6 +372,8 @@ export function createAvowa({
       instrumentOpenAI: c => c,
       instrumentAnthropic: c => c,
       _wrapResource: () => undefined,
+      approval: noop,
+      toolOutcome: noop,
       disabled: true
     };
   }
@@ -247,9 +405,14 @@ export function createAvowa({
     if (evt.guardrail_blocked !== undefined && evt.guardrail_blocked !== null) {
       payload.guardrail_blocked = !!evt.guardrail_blocked;
     }
-    for (const k of ['guardrail', 'decision_logged', 'human_reviewed', 'rationale_present', 'ai_disclosed', 'uncertainty_flagged', 'fairness_checked', 'blocked_category', 'pii_redacted', 'grounded', 'refused', 'injection_blocked', 'output_validated', 'system_prompt_protected', 'rate_limited', 'tool_authorized', 'action_authorized', 'model_pinned', 'eval_score', 'agent_run', 'tool_called', 'autonomy_depth', 'action_class', 'approval_required', 'approved_by_human', 'action_blocked', 'action_logged', 'agent_run_key', 'tools_offered', 'tools_invoked', 'injection_suspected', 'pii_detected', 'error', 'fallback_model', 'retries', 'token_ceiling', 'provider_throttled', 'requested_model', 'stop_reason', 'structured_output', 'refusal_part', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'system_prompt_present', 'tool_choice', 'messages_user', 'messages_assistant', 'messages_tool', 'input_images', 'input_files', 'input_audio', 'streaming', 'response_format_type', 'prompt_chars', 'output_chars', 'client_max_retries', 'client_timeout_s', 'pii_families', 'injection_families', 'temperature', 'top_p', 'seed', 'choices_n', 'stop_sequences', 'parallel_tool_calls', 'store_requested', 'logprobs', 'service_tier_requested', 'metadata_present', 'end_user_id_present', 'reasoning_effort', 'thinking_enabled', 'system_fingerprint', 'service_tier', 'provider_filtered', 'provider_filter_categories', 'ttft_ms', 'http_status', 'provider_error_code', 'retry_after_s', 'provider_lib', 'node_version', 'app_region', 'app_region_source']) {
+    for (const k of ['guardrail', 'decision_logged', 'human_reviewed', 'rationale_present', 'ai_disclosed', 'uncertainty_flagged', 'fairness_checked', 'blocked_category', 'pii_redacted', 'grounded', 'refused', 'injection_blocked', 'output_validated', 'system_prompt_protected', 'rate_limited', 'tool_authorized', 'action_authorized', 'model_pinned', 'eval_score', 'agent_run', 'tool_called', 'autonomy_depth', 'action_class', 'approval_required', 'approved_by_human', 'action_blocked', 'action_logged', 'agent_run_key', 'tools_offered', 'tools_invoked', 'injection_suspected', 'pii_detected', 'error', 'fallback_model', 'retries', 'token_ceiling', 'provider_throttled', 'requested_model', 'stop_reason', 'structured_output', 'refusal_part', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'system_prompt_present', 'tool_choice', 'messages_user', 'messages_assistant', 'messages_tool', 'input_images', 'input_files', 'input_audio', 'streaming', 'response_format_type', 'prompt_chars', 'output_chars', 'client_max_retries', 'client_timeout_s', 'pii_families', 'injection_families', 'temperature', 'top_p', 'seed', 'choices_n', 'stop_sequences', 'parallel_tool_calls', 'store_requested', 'logprobs', 'service_tier_requested', 'metadata_present', 'end_user_id_present', 'reasoning_effort', 'thinking_enabled', 'system_fingerprint', 'service_tier', 'provider_filtered', 'provider_filter_categories', 'ttft_ms', 'http_status', 'provider_error_code', 'retry_after_s', 'provider_lib', 'node_version', 'app_region', 'app_region_source', 'tool_calls', 'tool_results', 'mcp_servers_offered', 'mcp_tools_invoked', 'mcp_hosts', 'mcp_hosts_invoked']) {
       if (evt[k] !== undefined && evt[k] !== null) payload[k] = evt[k];
     }
+    const ctx = AGENT.getStore() || {};
+    const name = evt.agent_name !== undefined && evt.agent_name !== null ? String(evt.agent_name).slice(0, 64) : ctx.name;
+    if (name) payload.agent_name = name;
+    const cref = customerRef(secret, evt.customer !== undefined && evt.customer !== null ? evt.customer : ctx.customer);
+    if (cref) payload.customer_ref = cref;
     if (evt.endpoint) payload.endpoint = hostOf(evt.endpoint);
     const scanP = evt.scanPrompt !== undefined && evt.scanPrompt !== null ? cap(evt.scanPrompt, 'tail') : null;
     const scanO = evt.scanOutput !== undefined && evt.scanOutput !== null ? cap(evt.scanOutput, 'head') : null;
@@ -297,11 +460,58 @@ export function createAvowa({
     const batch = pending.splice(0, BATCH_MAX);
     if (pending.length) pendingTimer = setTimeout(flushPending, BATCH_WAIT_MS);
     if (!batch.length) return;
-    sendEnvelope(batch.map(b => b.payload)).then(r => batch.forEach(b => b.resolve(r)), e => batch.forEach(b => b.reject(e)));
+    sendEnvelope(batch.filter(b => !b.payload._annotation).map(b => b.payload), batch.filter(b => b.payload._annotation).map(b => b.payload._annotation)).then(r => batch.forEach(b => b.resolve(r)), e => batch.forEach(b => b.reject(e)));
   }
-  async function sendEnvelope(events) {
+  function annotate(ann) {
+    if (!key || !base) return Promise.resolve(null);
+    return enqueue({
+      _annotation: ann
+    }).catch(e => {
+      internalError('annotate', e);
+      return null;
+    });
+  }
+  const nowIso = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  function approval(callId, approved, approverRole, {
+    approverType = 'unknown',
+    policyRef
+  } = {}) {
+    const ref = callRef(callId);
+    if (!ref) return Promise.resolve(null);
+    if (!APPROVER_TYPES.includes(approverType)) {
+      warnOnce('approvertype', `approval() approverType must be one of ${APPROVER_TYPES.join(', ')}; recorded as unknown.`);
+      approverType = 'unknown';
+    }
+    const ann = {
+      type: 'approval',
+      tool_call_ref: ref,
+      approved: !!approved,
+      approver_type: approverType,
+      at: nowIso()
+    };
+    const role = approverRole === undefined || approverRole === null ? null : String(approverRole).slice(0, 40);
+    if (role && LABEL_RX.test(role)) ann.approver_role = role;
+    const pol = policyRef === undefined || policyRef === null ? null : String(policyRef).slice(0, 64);
+    if (pol && LABEL_RX.test(pol)) ann.policy_ref = pol;
+    return annotate(ann);
+  }
+  function toolOutcome(callId, outcome) {
+    const ref = callRef(callId);
+    if (!ref) return Promise.resolve(null);
+    if (!TOOL_OUTCOMES.includes(outcome)) {
+      warnOnce('outcome', `toolOutcome() takes one of ${TOOL_OUTCOMES.join(', ')}; that outcome was not recorded.`);
+      return Promise.resolve(null);
+    }
+    return annotate({
+      type: 'outcome',
+      tool_call_ref: ref,
+      outcome,
+      at: nowIso()
+    });
+  }
+  async function sendEnvelope(events, annotations = []) {
     const nonce = [...(globalThis.crypto && globalThis.crypto.getRandomValues ? globalThis.crypto.getRandomValues(new Uint8Array(12)) : (await import('node:crypto')).randomBytes(12))].map(b => b.toString(16).padStart(2, '0')).join('');
-    const body = JSON.stringify({
+    const envelope = {
       schema: SCHEMA,
       source: {
         kind: 'runtime',
@@ -311,7 +521,9 @@ export function createAvowa({
       sent_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
       nonce,
       events
-    });
+    };
+    if (annotations.length) envelope.annotations = annotations;
+    const body = JSON.stringify(envelope);
     const headers = {
       'Content-Type': 'application/json',
       'X-Ingest-Key': key,
@@ -615,6 +827,34 @@ export function createAvowa({
       f.tools_invoked = invoked;
       seen.push('tools_invoked');
     }
+    const calls = toolCalls(resp);
+    if (calls.length) {
+      f.tool_calls = calls;
+      seen.push('tool_calls');
+    }
+    const history = params && (Array.isArray(params.messages) ? params.messages : Array.isArray(params.input) ? params.input : null);
+    const results = toolResults(history);
+    if (results.length) {
+      f.tool_results = results;
+      seen.push('tool_results');
+    }
+    const mcp = mcpFacts(params, resp);
+    Object.assign(f, mcp);
+    seen.push(...Object.keys(mcp));
+    if (offered.length) {
+      const depth = autonomyDepth(history);
+      if (depth !== null) {
+        f.autonomy_depth = depth;
+        seen.push('autonomy_depth');
+      }
+      const rk = runKey(history, secret);
+      if (rk) {
+        Object.assign(f, {
+          agent_run_key: rk
+        });
+        seen.push('agent_run_key');
+      }
+    }
     return [f, seen];
   }
   function outputText(resp, kind) {
@@ -823,12 +1063,16 @@ export function createAvowa({
       region
     }, original.bind(resource));
   }
-  return {
+  const api = {
     capture,
     track,
     instrumentOpenAI,
     instrumentAnthropic,
-    _wrapResource
+    _wrapResource,
+    approval,
+    toolOutcome
   };
+  if (!DEFAULT && key) DEFAULT = api;
+  return api;
 }
 export default createAvowa;

@@ -96,12 +96,22 @@ function ask(question) {
 async function redeem(token, api) {
   const [base, problem] = checkedBase(api)
   if (problem) return [null, problem.replace('AVOWA_BASE_URL', '--api') + '.']
+  // One retry: in a container that has just started, the very first connection can fail once
+  // (seen 2026-11-17 in a fresh node:22-slim) and succeed a second later. The token is spent only
+  // by a request the server answers, so retrying a request that never arrived is safe.
   let r
-  try {
-    r = await fetch(base + '/public/sdk/setup', { method: 'POST', body: JSON.stringify({ token }),
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'avowa-runtime-js (+https://avowa.ai)' },
-      signal: AbortSignal.timeout(15000) })
-  } catch (e) { return [null, `Could not reach ${base} (${e.name}). Pass --api with your Avowa API URL.`] }
+  for (let attempt = 1; ; attempt++) {
+    try {
+      r = await fetch(base + '/public/sdk/setup', { method: 'POST', body: JSON.stringify({ token }),
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'avowa-runtime-js (+https://avowa.ai)' },
+        signal: AbortSignal.timeout(15000) })
+      break
+    } catch (e) {
+      if (attempt < 2) { await new Promise((ok) => setTimeout(ok, 1500)); continue }
+      const why = (e.cause && (e.cause.code || e.cause.message)) || e.name
+      return [null, `Could not reach ${base} (${why}). Check the address and that this machine can reach it, or pass --api with your Avowa API URL. The setup token was not used.`]
+    }
+  }
   if (r.status === 404) return [null, 'That setup token is invalid, expired (24h) or already used. Generate a new one in the console.']
   if (!r.ok) return [null, `${base} answered HTTP ${r.status}.`]
   const creds = await r.json()

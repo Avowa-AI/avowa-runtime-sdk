@@ -39,8 +39,8 @@ import urllib.request
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
-__version__ = "0.12.0"
-__all__ = ["AvowaRuntime"]
+__version__ = "0.13.0"
+__all__ = ["AvowaRuntime", "agent_context", "approval", "tool_outcome", "call_ref"]
 
 
 _CARD_RX = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
@@ -1065,7 +1065,18 @@ def _facts_from_response(resp, kwargs, salt=None):
     if offered or invoked:
         out["tools_invoked"] = invoked
         seen.append("tools_invoked")
+    calls = _tool_calls(resp)
+    if calls:
+        out["tool_calls"] = calls
+        seen.append("tool_calls")
     history = kwargs.get("messages") or kwargs.get("input")
+    results = _tool_results(history)
+    if results:
+        out["tool_results"] = results
+        seen.append("tool_results")
+    mcp = _mcp_facts(kwargs, resp)
+    out.update(mcp)
+    seen.extend(mcp)
     if offered:
         depth = _autonomy_depth(history)
         if depth is not None:
@@ -1174,6 +1185,182 @@ def _autonomy_depth(messages):
     return depth
 
 
+TOOL_OUTCOMES = ("ok", "error", "denied", "timeout")
+APPROVER_TYPES = ("human", "policy", "system", "unknown")
+CALL_REF_LEN = 20
+
+
+def call_ref(call_id):
+    """The reference Avowa uses for one tool call: 20 hex characters of SHA-256 over the provider's id.
+    A correlation pseudonym, not anonymisation: anyone who has the id can compute it."""
+    if call_id is None or call_id == "":
+        return None
+    return hashlib.sha256(("avowa-call:" + str(call_id)).encode("utf-8", "replace")).hexdigest()[:CALL_REF_LEN]
+
+
+def _get(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _tool_calls(resp):
+    out = []
+
+    def add(cid, name):
+        ref = call_ref(cid)
+        if ref and name:
+            out.append(ref + ":" + str(name)[:64])
+    try:
+        for b in (_get(resp, "content") or []):
+            if _get(b, "type") == "tool_use":
+                add(_get(b, "id"), _get(b, "name"))
+    except Exception:
+        pass
+    try:
+        for tc in (_get(_get(resp.choices[0], "message"), "tool_calls") or []):
+            add(_get(tc, "id"), _get(_get(tc, "function"), "name") or _get(tc, "name"))
+    except Exception:
+        pass
+    try:
+        for item in (_get(resp, "output") or []):
+            if _get(item, "type") in ("function_call", "custom_tool_call"):
+                add(_get(item, "call_id") or _get(item, "id"), _get(item, "name"))
+    except Exception:
+        pass
+    return out[:_TOOL_CAP]
+
+
+def _tool_results(history):
+    if not isinstance(history, list):
+        return []
+    fresh = []
+    for m in history:
+        role, typ = _get(m, "role"), _get(m, "type")
+        if role == "assistant" or typ in ("function_call", "custom_tool_call"):
+            fresh = []
+            continue
+        if role == "tool":
+            ref = call_ref(_get(m, "tool_call_id"))
+            if ref:
+                fresh.append(ref + ":returned")
+            continue
+        if typ in ("function_call_output", "custom_tool_call_output"):
+            ref = call_ref(_get(m, "call_id"))
+            if ref:
+                fresh.append(ref + ":returned")
+            continue
+        c = _get(m, "content")
+        if isinstance(c, list):
+            for b in c:
+                if _get(b, "type") == "tool_result":
+                    ref = call_ref(_get(b, "tool_use_id"))
+                    if ref:
+                        fresh.append(ref + (":error" if _get(b, "is_error") is True else ":returned"))
+    return fresh[:_TOOL_CAP]
+
+
+def _mcp_facts(kwargs, resp):
+    out, labels, hosts, ran, host_of = {}, [], [], [], {}
+    try:
+        for s in (kwargs.get("mcp_servers") or []):
+            lb, h = _get(s, "name"), _host_of(_get(s, "url"))
+            if lb:
+                labels.append(str(lb)[:64])
+            if h:
+                hosts.append(h)
+                if lb:
+                    host_of[str(lb)[:64]] = h
+        for t in (kwargs.get("tools") or []):
+            if _get(t, "type") == "mcp":
+                lb, h = _get(t, "server_label"), _host_of(_get(t, "server_url"))
+                if lb:
+                    labels.append(str(lb)[:64])
+                if h:
+                    hosts.append(h)
+                    if lb:
+                        host_of[str(lb)[:64]] = h
+    except Exception:
+        pass
+    try:
+        for b in (_get(resp, "content") or []):
+            if _get(b, "type") == "mcp_tool_use" and _get(b, "name"):
+                ran.append(str(_get(b, "server_name") or "?")[:64] + "/" + str(_get(b, "name"))[:64])
+        for item in (_get(resp, "output") or []):
+            if _get(item, "type") == "mcp_call" and _get(item, "name"):
+                ran.append(str(_get(item, "server_label") or "?")[:64] + "/" + str(_get(item, "name"))[:64])
+    except Exception:
+        pass
+    if labels:
+        out["mcp_servers_offered"] = sorted(set(labels))[:_TOOL_CAP]
+    if hosts:
+        out["mcp_hosts"] = sorted(set(hosts))[:_TOOL_CAP]
+    if labels or ran:
+        out["mcp_tools_invoked"] = sorted(set(ran))[:_TOOL_CAP]
+        used = sorted({host_of[r.split("/", 1)[0]] for r in ran if r.split("/", 1)[0] in host_of})
+        out["mcp_hosts_invoked"] = used[:_TOOL_CAP]
+    return out
+
+
+_AGENT = contextvars.ContextVar("avowa_agent", default=None)
+_LABEL_RX = re.compile(r"^[A-Za-z0-9 _.:/-]{1,64}$")
+
+
+@contextmanager
+def agent_context(name=None, customer=None):
+    """Every model call inside this block is recorded as made by agent `name` for `customer`.
+
+        with avowa_runtime.agent_context("triage", customer=account.id):
+            run_agent(...)
+
+    `name` is sent as written (64 characters, letters, digits and `_ . : / -`); `customer` is sent
+    only as a keyed hash. Works across threads started inside the block only if they copy the
+    context (contextvars), and across asyncio tasks automatically."""
+    nm = str(name)[:64] if name is not None else None
+    if nm is not None and not _LABEL_RX.match(nm):
+        _warn_once("agentname", "agent_context name must be letters, digits and _ . : / - (64 at most); "
+                                "the name was not recorded.")
+        nm = None
+    tok = _AGENT.set({"name": nm, "customer": None if customer is None else str(customer)})
+    try:
+        yield
+    finally:
+        _AGENT.reset(tok)
+
+
+def _customer_ref(secret, customer):
+    if customer is None or customer == "":
+        return None
+    key = os.getenv("AVOWA_REF_KEY") or secret
+    if not key:
+        return None
+    return hmac.new(str(key).encode("utf-8"), ("avowa-customer:" + str(customer)).encode("utf-8", "replace"),
+                    hashlib.sha256).hexdigest()[:12]
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+_DEFAULT = None
+
+
+def approval(call_id, approved, approver_role=None, approver_type="unknown", policy_ref=None):
+    """Record an approval decision on one tool call. See `AvowaRuntime.approval`."""
+    if _DEFAULT is None:
+        _warn_once("noruntime", "approval() was called but no Avowa runtime is running; nothing was recorded.")
+        return
+    _DEFAULT.approval(call_id, approved, approver_role, approver_type, policy_ref)
+
+
+def tool_outcome(call_id, outcome):
+    """Record how one tool call ended. See `AvowaRuntime.tool_outcome`."""
+    if _DEFAULT is None:
+        _warn_once("noruntime", "tool_outcome() was called but no Avowa runtime is running; nothing was recorded.")
+        return
+    _DEFAULT.tool_outcome(call_id, outcome)
+
+
 def _host_of(url):
     if not url:
         return None
@@ -1203,6 +1390,9 @@ class AvowaRuntime:
         self.default_model = default_model
         self.timeout = timeout
         self.async_send = async_send
+        global _DEFAULT
+        if _DEFAULT is None and self.key:
+            _DEFAULT = self
         self._q = queue.Queue(maxsize=10000) if async_send else None
         self._worker = None
         self._pid = None
@@ -1250,6 +1440,8 @@ class AvowaRuntime:
                 messages_tool=None, input_images=None, input_files=None, input_audio=None, streaming=None,
                 response_format_type=None, prompt_chars=None, output_chars=None, client_max_retries=None,
                 client_timeout_s=None, pii_families=None, injection_families=None,
+                tool_calls=None, tool_results=None, mcp_servers_offered=None, mcp_tools_invoked=None,
+                mcp_hosts=None, mcp_hosts_invoked=None, agent_name=None, customer=None,
                 _sdk_observed=None,
                 **unknown):
         """Record one inference signal (fire-and-forget).
@@ -1296,6 +1488,11 @@ class AvowaRuntime:
           approved_by_human  bool  — a human actually approved it
           action_blocked     bool  — the action was blocked by policy in the execution path
           action_logged      bool  — the action was written to an attributable audit trail
+          agent_name         str   — which of your agents made the call (or use `agent_context`)
+          customer           str   — which of YOUR customers it ran for; sent only as a keyed hash
+        A human approval or a tool's outcome happens AFTER the model call that proposed the tool, so
+        it is recorded on its own with `approval(call_id, …)` / `tool_outcome(call_id, …)`, joined
+        to the call by the provider's tool-call id.
 
         OBSERVED fields — these are the ones Avowa grades as evidence it saw for itself (L3), rather
         than a claim your application made about itself (L2 "runtime-asserted"). Prefer these:
@@ -1359,9 +1556,19 @@ class AvowaRuntime:
                      ("response_format_type", response_format_type), ("prompt_chars", prompt_chars),
                      ("output_chars", output_chars), ("client_max_retries", client_max_retries),
                      ("client_timeout_s", client_timeout_s), ("pii_families", pii_families),
-                     ("injection_families", injection_families)):
+                     ("injection_families", injection_families),
+                     ("tool_calls", tool_calls), ("tool_results", tool_results),
+                     ("mcp_servers_offered", mcp_servers_offered), ("mcp_tools_invoked", mcp_tools_invoked),
+                     ("mcp_hosts", mcp_hosts), ("mcp_hosts_invoked", mcp_hosts_invoked)):
             if v is not None:
                 evt[k] = v
+        ctx = _AGENT.get() or {}
+        name = agent_name if agent_name is not None else ctx.get("name")
+        if name is not None:
+            evt["agent_name"] = str(name)[:64]
+        cref = _customer_ref(self.secret, customer if customer is not None else ctx.get("customer"))
+        if cref:
+            evt["customer_ref"] = cref
         call = _CALL_FACTS.get() or {}
         more = {**_env_facts(), **call}
         for k, v in more.items():
@@ -1395,6 +1602,59 @@ class AvowaRuntime:
         else:
             _apply_scan(evt, scan)
             self._post(evt)
+
+    def approval(self, call_id, approved, approver_role=None, approver_type="unknown", policy_ref=None):
+        """Record an approval decision on one tool call: approved (`approved=True`) or refused.
+
+        `call_id` is the provider's id for the call (`tool_use.id`, `tool_calls[i].id`, or a
+        Responses `call_id`); only its hash is sent, and the server joins it to the model call that
+        proposed it.
+
+        `approver_type` says WHO decided: "human", "policy" (a policy engine or rule), "system"
+        (another automated component) or "unknown". Only "human" counts as human oversight, so pass
+        it when a person made the call. `approver_role` is a short label such as "finance_ops",
+        never a person's name; `policy_ref` a short label naming the rule that decided.
+        This is your app's statement about itself and is graded as one: Avowa cannot see the
+        decision, and does not claim it came before the tool ran."""
+        ref = call_ref(call_id)
+        if ref is None:
+            return
+        kind = approver_type if approver_type in APPROVER_TYPES else "unknown"
+        if approver_type not in APPROVER_TYPES:
+            _warn_once("approvertype", "approval() approver_type must be one of %s; recorded as unknown." % ", ".join(APPROVER_TYPES))
+        ann = {"type": "approval", "tool_call_ref": ref, "approved": bool(approved),
+               "approver_type": kind, "at": _now_iso()}
+        role = None if approver_role is None else str(approver_role)[:40]
+        if role and _LABEL_RX.match(role):
+            ann["approver_role"] = role
+        pol = None if policy_ref is None else str(policy_ref)[:64]
+        if pol and _LABEL_RX.match(pol):
+            ann["policy_ref"] = pol
+        self._annotate(ann)
+
+    def tool_outcome(self, call_id, outcome):
+        """Record how one tool call ended: "ok", "error", "denied" (a policy or a person stopped it)
+        or "timeout". Your app's statement, joined to the proposing call by the provider's id."""
+        ref = call_ref(call_id)
+        if ref is None:
+            return
+        if outcome not in TOOL_OUTCOMES:
+            _warn_once("outcome", "tool_outcome() takes one of %s; that outcome was not recorded." % ", ".join(TOOL_OUTCOMES))
+            return
+        self._annotate({"type": "outcome", "tool_call_ref": ref, "outcome": outcome, "at": _now_iso()})
+
+    def _annotate(self, ann):
+        if self.disabled or not (self.key and self.base):
+            return
+        if self.async_send:
+            self._ensure_worker()
+            try:
+                self._q.put_nowait(({"_annotation": ann}, None))
+            except queue.Full:
+                _warn_once("qfull", "signal queue is full — signals are being dropped. The "
+                                    "backend is unreachable or far slower than your traffic.")
+        else:
+            self._post_many([], [ann])
 
     @contextmanager
     def track(self, model=None, region=None, train_on_data=None, **asserts):
@@ -1615,14 +1875,19 @@ class AvowaRuntime:
                 batch.append(nxt)
                 stop = nxt is None
             try:
-                events = []
+                events, anns = [], []
                 for it in batch:
                     if it is None:
                         continue
                     evt, scan = it
+                    if "_annotation" in evt:
+                        anns.append(evt["_annotation"])
+                        continue
                     _apply_scan(evt, scan)
                     events.append(evt)
-                if events:
+                if anns:
+                    self._post_many(events, anns)
+                elif events:
                     self._post_many(events)
             except Exception as e:
                 _internal_error("sender", e, fatal_in_strict=False)
@@ -1635,11 +1900,13 @@ class AvowaRuntime:
     def _post(self, evt):
         self._post_many([evt])
 
-    def _post_many(self, events):
+    def _post_many(self, events, annotations=()):
         envelope = {"schema": _SCHEMA, "source": {"kind": "runtime", "client": "avowa-runtime-python",
                                                   "version": __version__},
                     "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "nonce": os.urandom(12).hex(), "events": list(events)}
+        if annotations:
+            envelope["annotations"] = list(annotations)
         body = json.dumps(envelope, separators=(",", ":"))
         headers = {"Content-Type": "application/json", "X-Ingest-Key": self.key,
                    "User-Agent": f"avowa-runtime-python/{__version__} (+https://avowa.ai)"}
