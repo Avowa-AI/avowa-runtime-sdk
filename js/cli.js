@@ -9,12 +9,14 @@
  *   init --dry-run         show what init would do; changes nothing, uses no token
  *   status                 what is wired, what is covered, does the server know this key
  *   doctor                 the server check only (sends no signal)
+ *   ref <tool-call-id>     the reference Avowa shows for a provider tool call id (toolu_..., call_...)
+ *   ref --find <ref> <file>...   find the tool call behind a reference in your own logs (local only)
  */
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import readline from 'node:readline'
-import { checkedBase, makeToken, readToken, SDK_VERSION as VERSION } from './avowa-runtime.js'
+import { checkedBase, makeToken, readToken, callRef, SDK_VERSION as VERSION } from './avowa-runtime.js'
 import { loadEnv } from './env.js'
 
 const REGISTER = '@avowa/runtime/register'
@@ -23,6 +25,8 @@ const USAGE = `usage: npx @avowa/runtime <command>
   init <setup-token> [--api https://api.avowa.ai] [--dry-run] [--yes]
   status
   doctor
+  ref <tool-call-id>...            the reference Avowa shows for a provider tool call id
+  ref --find <ref> <file>...       find that call in your own logs ("-" reads stdin); nothing is sent
 
 Generate the setup token in the Avowa console: Connections, Runtime SDK.
 In production set two variables and change nothing else:
@@ -198,7 +202,7 @@ async function reportSetup(key, secret, base, pkg, isWired) {
     if (!who.signature_ok) return 'server check  : the secret did NOT verify. Run `npx @avowa/runtime status`.'
     if (!who.capture_allowed) return "server check  : key accepted, but this workspace's plan does not allow capture yet"
     return 'server check  : key and signature accepted (your console card now shows this step done)'
-  } catch (e) { return `server check  : could not confirm (${e.name}). Run \`npx @avowa/runtime status\` to see why.` }
+  } catch (e) { return `server check  : could not reach ${base} (${e.name}). This is the address in your credential; AVOWA_BASE_URL overrides it. Run \`npx @avowa/runtime status\` for more.` }
 }
 
 // Asks the server who this key is. Sends no signal: a synthetic one would show on the trust
@@ -237,7 +241,7 @@ async function doctor() {
     ok = ok && Math.abs(s) < 300
   }
   console.log(`last event : ${who.last_event_at || 'never'} (${who.events_total || 0} total)`)
-  console.log('\nNo signal was sent.' + (ok ? '' : ' Fix the lines marked above, then run again.'))
+  console.log('\nThis check sent no signal.' + (ok ? '' : ' Fix the lines marked above, then run again.'))
   return ok ? 0 : 1
 }
 
@@ -256,10 +260,36 @@ async function status() {
   return doctor()
 }
 
+// Avowa names a tool call by a hash of the provider's id. This goes the other way, locally: id ->
+// reference, or a reference -> the line in your logs holding its id. Prints file:line and the id only.
+async function ref(args) {
+  if (!args.length) { console.error('usage: npx @avowa/runtime ref <tool-call-id>...  |  ref --find <ref> <file>...'); return 2 }
+  if (args[0] !== '--find') { for (const id of args) console.log(`${callRef(id)}  ${id}`); return 0 }
+  if (args.length < 3) { console.error('usage: npx @avowa/runtime ref --find <ref> <file>...  ("-" reads stdin)'); return 2 }
+  const want = args[1].trim().toLowerCase()
+  const tok = /[A-Za-z0-9][A-Za-z0-9_-]{5,127}/g
+  let found = 0
+  for (const p of args.slice(2)) {
+    let stream
+    try { stream = p === '-' ? process.stdin : fs.createReadStream(p, { encoding: 'utf8' }) } catch (e) { console.error(`${p}: ${e.message}`); continue }
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
+    let n = 0
+    try {
+      for await (const line of rl) {
+        n++
+        for (const t of new Set(line.match(tok) || [])) if (callRef(t) === want) { console.log(`${p}:${n}  ${t}`); found++ }
+      }
+    } catch (e) { console.error(`${p}: ${e.message}`) }
+  }
+  if (!found) console.error(`no tool call id in those files has reference ${want}`)
+  return found ? 0 : 1
+}
+
 const [cmd, ...rest] = process.argv.slice(2)
 let code
 if (cmd === 'init') code = await init(rest)
 else if (cmd === 'status') code = await status()
 else if (cmd === 'doctor') code = await doctor()
+else if (cmd === 'ref') code = await ref(rest)
 else { console.error(USAGE); code = cmd && !['-h', '--help', 'help'].includes(cmd) ? 2 : (cmd ? 0 : 2) }
 process.exitCode = code

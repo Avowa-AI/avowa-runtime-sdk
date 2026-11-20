@@ -776,7 +776,8 @@ for (const [kind, api] of [['anthropic', 'messages'], ['openai', 'chat'], ['open
       const b = got[0].body;
       for (const k of NEVER) assert.equal(b[k], undefined, `the client sent ${k}`);
       assert.ok(!JSON.stringify(b).includes('SECRET-'), 'text left the process');
-      assert.ok(b.model && b.endpoint && b.latency_ms >= 0 && b._sdk_observed.includes('model'));
+      assert.ok(b.model && b.endpoint && b.latency_ms >= 0);
+      assert.equal(b._sdk_observed.includes('model'), scenario !== 'rate_limited');
       if (scenario === 'rate_limited') assert.equal(b.error, 'RateLimitError');else {
         assert.ok(b.stop_reason, 'the outcome reaches the server');
         assert.ok(b.requested_model);

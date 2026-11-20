@@ -268,7 +268,7 @@ def _main(argv):
         elif isinstance(rf, list):
             print("meta fields: %s" % (", ".join("%s (%s %s.%s)" % (f.get("name"), f.get("provider"), f.get("from"), f.get("path"))
                                                 for f in rf) or "none beyond the built-in metadata"))
-        print("\nNo signal was sent." + ("" if ok else " Fix the lines marked above, then run again."))
+        print("\nThis check sent no signal." + ("" if ok else " Fix the lines marked above, then run again."))
         return 0 if ok else 1
     if "--check" in argv:
         import urllib.request

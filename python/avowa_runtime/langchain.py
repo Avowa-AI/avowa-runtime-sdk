@@ -60,14 +60,15 @@ class AvowaCallbackHandler(_Base):
         start, asked, prompt, provider = self._runs.pop(run_id, (time.time(), None, "", None))
         try:
             llm_output = getattr(response, "llm_output", None) or {}
-            served = llm_output.get("model_name") or llm_output.get("model") or asked
+            named = llm_output.get("model_name") or llm_output.get("model")
+            served = named or asked
             gens = getattr(response, "generations", None) or []
             gen = gens[0][0] if gens and gens[0] else None
             info = getattr(gen, "generation_info", None) or {}
             fr = info.get("finish_reason") or info.get("stop_reason")
             text = getattr(gen, "text", "") or ""
             self._emit(served, asked, fr, text, prompt, provider, None, start,
-                       usage=llm_output.get("token_usage") or llm_output.get("usage"))
+                       usage=llm_output.get("token_usage") or llm_output.get("usage"), named=bool(named))
         except Exception as e:
             _internal_error("langchain.llm_end", e)
 
@@ -84,13 +85,13 @@ class AvowaCallbackHandler(_Base):
         except Exception as e:
             _internal_error("langchain.tool_start", e)
 
-    def _emit(self, served, asked, fr, text, prompt, provider, err, start, usage=None):
+    def _emit(self, served, asked, fr, text, prompt, provider, err, start, usage=None, named=False):
         try:
             summary = _Obj(model=served, stop_reason=fr, usage=usage, content=[_Obj(type="text", text=text)])
             facts, seen = _facts_from_response(summary, {"model": asked})
             extra = dict(self.asserts)
             extra.update(facts)
-            seen += ["model", "latency_ms"] + (["endpoint"] if provider else []) + (["error"] if err else [])
+            seen += (["model"] if named else []) + ["latency_ms"] + (["endpoint"] if provider else []) + (["error"] if err else [])
             if self.scan:
                 seen += ["pii_detected", "injection_suspected", "pii_families", "injection_families"]
             extra["_sdk_observed"] = seen

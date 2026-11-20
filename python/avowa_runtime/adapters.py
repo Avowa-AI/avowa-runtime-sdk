@@ -70,7 +70,7 @@ def instrument_bedrock(rt, client, region=None, scan=True, asserts=None):
                 req, req_seen = _facts_from_request({**kwargs, "max_tokens": (kwargs.get("inferenceConfig") or {}).get("maxTokens"),
                                                      "tool_choice": next(iter(((kwargs.get("toolConfig") or {}).get("toolChoice") or {})), None)})
                 extra.update(req); seen += req_seen
-                seen += ["model", "endpoint", "latency_ms"] + (["error"] if err else [])
+                seen += (["model"] if (resp is not None and not err) else []) + ["endpoint", "latency_ms"] + (["error"] if err else [])
                 if scan:
                     seen += ["pii_detected", "injection_suspected", "pii_families", "injection_families"]
                 extra["_sdk_observed"] = seen
@@ -152,7 +152,7 @@ def instrument_gemini(rt, client, region=None, scan=True, asserts=None):
             ceil = cfg.get("max_output_tokens") if isinstance(cfg, dict) else getattr(cfg, "max_output_tokens", None)
             req, req_seen = _facts_from_request({"max_tokens": ceil})
             extra.update(req); seen += req_seen
-            seen += ["model", "endpoint", "latency_ms"] + (["error"] if err else [])
+            seen += (["model"] if getattr(resp, "model_version", None) else []) + ["endpoint", "latency_ms"] + (["error"] if err else [])
             if scan:
                 seen += ["pii_detected", "injection_suspected", "pii_families", "injection_families"]
             extra["_sdk_observed"] = seen

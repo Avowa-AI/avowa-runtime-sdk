@@ -9,6 +9,9 @@ after `avowa init` your app starts with the command it has always used.
     avowa status                 is the hook in place, what is covered, does the server know this key
     avowa doctor                 the server check only (sends no signal)
     avowa run <command>          start one command instrumented, without the start-up hook
+    avowa ref <tool-call-id>     the reference Avowa shows for a provider tool call id (toolu_..., call_...)
+    avowa ref --find <ref> <file>...   find the tool call behind a reference in your own logs
+                                 (computed here; nothing is sent; "-" reads stdin)
 
 In production set one variable, AVOWA_TOKEN, in your secret store. Nothing else changes.
 AVOWA_DISABLE=1 switches everything off.
@@ -139,7 +142,8 @@ def _report_setup(key, secret, base, wired):
         r = urllib.request.urlopen(urllib.request.Request(base + "/ingest/whoami", headers=headers), timeout=8)
         who = json.loads(r.read() or b"{}")
     except Exception as e:
-        return "server check  : could not confirm (%s). Run `avowa status` to see why." % (getattr(e, "code", None) or type(e).__name__)
+        return ("server check  : could not reach %s (%s). This is the address in your credential; "
+                "AVOWA_BASE_URL overrides it. Run `avowa status` for more." % (base, getattr(e, "code", None) or type(e).__name__))
     if not who.get("signature_ok"):
         return "server check  : the secret did NOT verify. Run `avowa status`."
     if not who.get("capture_allowed"):
@@ -274,6 +278,48 @@ def status(args):
     return _auto_main(["--doctor"])
 
 
+def ref(args):
+    """Avowa names a tool call by a hash of the provider's id, so a finding can point at a call without
+    the id leaving your process. This goes the other way, locally: id -> reference, or a reference ->
+    the line in your own logs that holds its id. Prints file:line and the id, never the line itself."""
+    import re
+    from avowa_runtime import call_ref
+    if not args:
+        sys.stderr.write("usage: avowa ref <tool-call-id>...   |   avowa ref --find <ref> <file>...\n")
+        return 2
+    if args[0] != "--find":
+        for cid in args:
+            print("%s  %s" % (call_ref(cid), cid))
+        return 0
+    if len(args) < 3:
+        sys.stderr.write("usage: avowa ref --find <ref> <file>...  (\"-\" reads stdin)\n")
+        return 2
+    want = args[1].strip().lower()
+    tok = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{5,127}")
+    found = 0
+    def scan(path, fh):
+        n_hit = 0
+        for n, line in enumerate(fh, 1):
+            for t in set(tok.findall(line)):
+                if call_ref(t) == want:
+                    print("%s:%d  %s" % (path, n, t))
+                    n_hit += 1
+        return n_hit
+
+    for path in args[2:]:
+        if path == "-":
+            found += scan(path, sys.stdin)
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                found += scan(path, fh)
+        except OSError as e:
+            sys.stderr.write("%s: %s\n" % (path, e.strerror))
+    if not found:
+        sys.stderr.write("no tool call id in those files has reference %s\n" % want)
+    return 0 if found else 1
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     import avowa_runtime
@@ -292,6 +338,8 @@ def main(argv=None):
     if cmd == "run":
         from .run import main as _run
         return _run(rest)
+    if cmd == "ref":
+        return ref(rest)
     if cmd in ("--version", "version"):
         from . import __version__
         print(__version__)

@@ -3,7 +3,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 const env = typeof process !== 'undefined' && process.env || {};
-const VERSION = '0.13.0';
+const VERSION = '0.13.1';
 const SCHEMA = 'avowa.signal/1';
 export const SDK_VERSION = VERSION;
 let _subtle = null;
@@ -236,7 +236,7 @@ function toolResults(history) {
   for (const m of history) {
     const role = g(m, 'role'),
       typ = g(m, 'type');
-    if (role === 'assistant' || typ === 'function_call' || typ === 'custom_tool_call') {
+    if (role === 'assistant' || MODEL_ITEMS.has(typ)) {
       fresh = [];
       continue;
     }
@@ -297,6 +297,10 @@ function mcpFacts(params, resp) {
   return f;
 }
 function runKey(messages, secret) {
+  if (typeof messages === 'string') messages = [{
+    role: 'user',
+    content: messages
+  }];
   if (!Array.isArray(messages)) return null;
   for (const m of messages) {
     if (g(m, 'role') !== 'user') continue;
@@ -308,19 +312,52 @@ function runKey(messages, secret) {
   }
   return null;
 }
-function autonomyDepth(messages) {
-  if (!Array.isArray(messages)) return null;
-  let d = 0;
+const MODEL_ITEMS = new Set(['function_call', 'custom_tool_call', 'mcp_call', 'computer_call', 'web_search_call', 'file_search_call', 'code_interpreter_call', 'local_shell_call', 'reasoning']);
+const CALL_ITEMS = new Set(['function_call', 'custom_tool_call', 'mcp_call', 'computer_call', 'local_shell_call']);
+const RESULT_ITEMS = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'local_shell_call_output', 'mcp_approval_response']);
+function modelTurns(messages) {
+  const turns = [];
+  let cur = null;
   for (const m of messages) {
-    if (g(m, 'role') !== 'assistant') continue;
-    if (Array.isArray(g(m, 'tool_calls')) && m.tool_calls.length) {
-      d++;
+    const role = g(m, 'role'),
+      typ = g(m, 'type');
+    if (!(MODEL_ITEMS.has(typ) || role === 'assistant')) {
+      cur = null;
+      turns.push([false, false]);
       continue;
     }
-    const c = g(m, 'content');
-    if (Array.isArray(c) && c.some(b => g(b, 'type') === 'tool_use')) d++;
+    let tools = CALL_ITEMS.has(typ);
+    if (role === 'assistant') {
+      if (Array.isArray(g(m, 'tool_calls')) && m.tool_calls.length) tools = true;
+      const c = g(m, 'content');
+      if (Array.isArray(c) && c.some(b => g(b, 'type') === 'tool_use')) tools = true;
+    }
+    if (role === 'assistant' && typ === undefined) {
+      cur = null;
+      turns.push([true, tools]);
+      continue;
+    }
+    if (!cur) {
+      cur = [true, false];
+      turns.push(cur);
+    }
+    cur[1] = cur[1] || tools;
   }
-  return d;
+  return turns;
+}
+function autonomyDepth(messages) {
+  if (typeof messages === 'string') return 0;
+  if (!Array.isArray(messages)) return null;
+  try {
+    return modelTurns(messages).filter(([m, t]) => m && t).length;
+  } catch {
+    return null;
+  }
+}
+const CHAIN = new Map();
+function chainPut(id, key, next) {
+  CHAIN.set(String(id), [key, next]);
+  while (CHAIN.size > 4096) CHAIN.delete(CHAIN.keys().next().value);
 }
 const AGENT = new AsyncLocalStorage();
 export function agentContext({
@@ -636,8 +673,12 @@ export function createAvowa({
           audio: 0
         };
       let chars = 0;
+      try {
+        roles.assistant += modelTurns(msgs).filter(([mt]) => mt).length - msgs.filter(m => g(m, 'role') === 'assistant').length;
+      } catch {}
       for (const m of msgs) {
         if (!m) continue;
+        if (RESULT_ITEMS.has(m.type)) roles.tool++;
         if (m.role === 'system' || m.role === 'developer') system = true;else if (m.role in roles) roles[m.role]++;
         if (typeof m.content === 'string') chars += m.content.length;else if (Array.isArray(m.content)) {
           for (const b of m.content) {
@@ -819,7 +860,7 @@ export function createAvowa({
           if (n) invoked.push(String(n).slice(0, 64));
         }
         for (const it of resp.output || []) {
-          if (it && it.type === 'function_call' && it.name) invoked.push(String(it.name).slice(0, 64));
+          if (it && (it.type === 'function_call' || it.type === 'custom_tool_call') && it.name) invoked.push(String(it.name).slice(0, 64));
         }
       }
     } catch {}
@@ -832,7 +873,7 @@ export function createAvowa({
       f.tool_calls = calls;
       seen.push('tool_calls');
     }
-    const history = params && (Array.isArray(params.messages) ? params.messages : Array.isArray(params.input) ? params.input : null);
+    const history = params && (Array.isArray(params.messages) ? params.messages : Array.isArray(params.input) || typeof params.input === 'string' ? params.input : null);
     const results = toolResults(history);
     if (results.length) {
       f.tool_results = results;
@@ -842,18 +883,32 @@ export function createAvowa({
     Object.assign(f, mcp);
     seen.push(...Object.keys(mcp));
     if (offered.length) {
-      const depth = autonomyDepth(history);
+      let depth = autonomyDepth(history);
+      let rk = runKey(history, secret);
+      if (params.previous_response_id) {
+        const parent = CHAIN.get(String(params.previous_response_id));
+        if (!parent) {
+          depth = null;
+          rk = null;
+        } else {
+          rk = parent[0];
+          depth = parent[1] === null || depth === null ? null : parent[1] + depth;
+        }
+      } else if (params.conversation) {
+        depth = null;
+        rk = null;
+      }
       if (depth !== null) {
         f.autonomy_depth = depth;
         seen.push('autonomy_depth');
       }
-      const rk = runKey(history, secret);
       if (rk) {
         Object.assign(f, {
           agent_run_key: rk
         });
         seen.push('agent_run_key');
       }
+      if (resp.id && Array.isArray(resp.output)) chainPut(resp.id, rk, depth === null ? null : depth + (calls.length ? 1 : 0));
     }
     return [f, seen];
   }
@@ -871,6 +926,10 @@ export function createAvowa({
       stop = null,
       size = 0,
       ttft = null;
+    let completed = null,
+      usage = null;
+    const chatCalls = new Map(),
+      blocks = [];
     const started = Date.now();
     const text = [];
     const keep = t => {
@@ -887,12 +946,38 @@ export function createAvowa({
         if (t === 'message_delta' && c.delta && c.delta.stop_reason) stop = c.delta.stop_reason;
         if (t === 'content_block_delta' && c.delta && c.delta.text) keep(c.delta.text);
         if (t.endsWith('output_text.delta') && typeof c.delta === 'string') keep(c.delta);
-        if (t === 'response.completed' && c.response && c.response.model) model = c.response.model;
+        if (t === 'response.completed' && c.response) {
+          completed = c.response;
+          if (c.response.model) model = c.response.model;
+        }
+        if (t === 'content_block_start' && c.content_block && c.content_block.type === 'tool_use') blocks.push({
+          type: 'tool_use',
+          id: c.content_block.id,
+          name: c.content_block.name
+        });
+        if (t === 'message_start' && c.message && c.message.usage) usage = {
+          ...(usage || {}),
+          input_tokens: c.message.usage.input_tokens
+        };
+        if (t === 'message_delta' && c.usage && c.usage.output_tokens != null) usage = {
+          ...(usage || {}),
+          output_tokens: c.usage.output_tokens
+        };
         if (!t && c.model) model = c.model;
+        if (!t && c.usage && c.usage.prompt_tokens != null) usage = {
+          prompt_tokens: c.usage.prompt_tokens,
+          completion_tokens: c.usage.completion_tokens
+        };
         const ch = c.choices && c.choices[0];
         if (ch) {
           if (ch.finish_reason) stop = ch.finish_reason;
           if (ch.delta && typeof ch.delta.content === 'string') keep(ch.delta.content);
+          for (const tc of ch.delta && ch.delta.tool_calls || []) {
+            const slot = chatCalls.get(tc.index || 0) || [null, null];
+            if (tc.id) slot[0] = tc.id;
+            if (tc.function && tc.function.name) slot[1] = tc.function.name;
+            chatCalls.set(tc.index || 0, slot);
+          }
         }
       } catch {}
     };
@@ -901,20 +986,30 @@ export function createAvowa({
       if (done) return;
       done = true;
       const all = text.join('');
-      const summary = kind === 'anthropic' ? {
+      const calls = [...chatCalls.entries()].sort((a, b) => a[0] - b[0]).filter(([, [, n]]) => n).map(([, [id, name]]) => ({
+        id,
+        type: 'function',
+        function: {
+          name
+        }
+      }));
+      const summary = completed ? completed : kind === 'anthropic' ? {
         model,
         stop_reason: stop,
+        usage,
         content: [{
           type: 'text',
           text: all
-        }]
+        }, ...blocks]
       } : {
         model,
         output_text: all,
+        usage,
         choices: [{
           finish_reason: stop,
           message: {
-            content: all
+            content: all,
+            tool_calls: calls.length ? calls : undefined
           }
         }]
       };
@@ -990,7 +1085,8 @@ export function createAvowa({
             facts.output_chars = out.length;
             seen.push('output_chars');
           }
-          seen.push('model', 'endpoint', 'latency_ms');
+          if (resp && typeof resp.model === 'string' && resp.model) seen.push('model');
+          seen.push('endpoint', 'latency_ms');
           if (err) seen.push('error');
           if (opts.scan !== false) seen.push('pii_detected', 'injection_suspected', 'pii_families', 'injection_families');
           const prompt = kind === 'anthropic' ? textOfMessages(params.messages) : textOfMessages(params.messages || (Array.isArray(params.input) ? params.input : [params.input]));

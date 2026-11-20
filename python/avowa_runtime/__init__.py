@@ -39,7 +39,7 @@ import urllib.request
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 __all__ = ["AvowaRuntime", "agent_context", "approval", "tool_outcome", "call_ref"]
 
 
@@ -394,6 +394,10 @@ class _StreamWatch:
         self._record, self._kwargs, self._start, self._label = record, kwargs, start, label
         self._model, self._stop, self._text, self._size, self._done = None, None, [], 0, False
         self._ttft = None
+        self._completed = None
+        self._chat_calls = {}
+        self._blocks = []
+        self._usage = {}
 
     def see(self, c):
         if self._ttft is None:
@@ -410,8 +414,23 @@ class _StreamWatch:
                 self._keep(delta.text)
             if t.endswith("output_text.delta") and isinstance(delta, str):
                 self._keep(delta)
-            if t == "response.completed" and getattr(getattr(c, "response", None), "model", None):
-                self._model = c.response.model
+            if t == "response.completed" and getattr(c, "response", None) is not None:
+                self._completed = c.response
+                if getattr(c.response, "model", None):
+                    self._model = c.response.model
+            if t == "content_block_start":
+                cb = getattr(c, "content_block", None)
+                if getattr(cb, "type", None) == "tool_use":
+                    self._blocks.append(_Obj(type="tool_use", id=getattr(cb, "id", None),
+                                             name=getattr(cb, "name", None)))
+            if t == "message_start":
+                u = getattr(msg, "usage", None)
+                if u is not None:
+                    self._usage["input_tokens"] = getattr(u, "input_tokens", None)
+            if t == "message_delta":
+                u = getattr(c, "usage", None)
+                if u is not None and getattr(u, "output_tokens", None) is not None:
+                    self._usage["output_tokens"] = u.output_tokens
             if getattr(c, "model", None) and not t:
                 self._model = c.model
             choices = getattr(c, "choices", None) or []
@@ -420,9 +439,21 @@ class _StreamWatch:
                 fr = getattr(ch, "finish_reason", None)
                 if fr:
                     self._stop = fr
-                content = getattr(getattr(ch, "delta", None), "content", None)
+                d = getattr(ch, "delta", None)
+                content = getattr(d, "content", None)
                 if isinstance(content, str) and content:
                     self._keep(content)
+                for tc in (getattr(d, "tool_calls", None) or []):
+                    slot = self._chat_calls.setdefault(getattr(tc, "index", 0), [None, None])
+                    if getattr(tc, "id", None):
+                        slot[0] = tc.id
+                    fn = getattr(getattr(tc, "function", None), "name", None)
+                    if fn:
+                        slot[1] = fn
+            u = getattr(c, "usage", None)
+            if u is not None and not t and getattr(u, "prompt_tokens", None) is not None:
+                self._usage = {"prompt_tokens": u.prompt_tokens,
+                               "completion_tokens": getattr(u, "completion_tokens", None)}
         except Exception:
             pass
 
@@ -436,19 +467,59 @@ class _StreamWatch:
             return
         self._done = True
         text = "".join(self._text)
-        if self._label.startswith("anthropic"):
-            summary = _Obj(model=self._model, stop_reason=self._stop, content=[_Obj(type="text", text=text)])
+        usage = _Obj(**self._usage) if self._usage else None
+        if self._completed is not None:
+            summary = self._completed
+        elif self._label.startswith("anthropic"):
+            summary = _Obj(model=self._model, stop_reason=self._stop, usage=usage,
+                           content=[_Obj(type="text", text=text)] + self._blocks)
         else:
-            summary = _Obj(model=self._model, output_text=text,
-                           choices=[_Obj(finish_reason=self._stop, message=_Obj(content=text, tool_calls=None))])
+            calls = [_Obj(id=i, type="function", function=_Obj(name=n))
+                     for _, (i, n) in sorted(self._chat_calls.items()) if n] or None
+            summary = _Obj(model=self._model, output_text=text, usage=usage,
+                           choices=[_Obj(finish_reason=self._stop, message=_Obj(content=text, tool_calls=calls))])
         try:
             self._record(summary, err, int((time.time() - self._start) * 1000), self._kwargs, ttft_ms=self._ttft)
         except Exception as e:
             _internal_error("stream.finish", e)
 
 
+def _is_raw(resp):
+    return (resp is not None and getattr(resp, "http_response", None) is not None
+            and callable(getattr(resp, "parse", None)) and not hasattr(resp, "_iterator"))
+
+
+def _hook_parse(raw, then):
+    orig = raw.parse
+    done = [False]
+
+    def _once(out):
+        if done[0]:
+            return out
+        done[0] = True
+        try:
+            return then(out)
+        except Exception as e:
+            _internal_error("parse.observe", e)
+            return out
+    if inspect.iscoroutinefunction(orig):
+        async def parse(*a, **k):
+            return _once(await orig(*a, **k))
+    else:
+        def parse(*a, **k):
+            return _once(orig(*a, **k))
+    try:
+        raw.parse = parse
+        return True
+    except Exception:
+        return False
+
+
 def _observe_stream(resp, watch):
     it = getattr(resp, "_iterator", None)
+    if it is None and _is_raw(resp):
+        if _hook_parse(resp, lambda stream: _observe_stream(stream, watch)):
+            return resp
     if it is None:
         return _StreamProxy(resp, watch)
     try:
@@ -581,6 +652,13 @@ def _wrap_call(original, record, label):
             record(None, e, int((time.time() - start) * 1000), kwargs)
             raise
 
+        def _done(real):
+            if _is_raw(real) and _hook_parse(
+                    real, lambda out: (record(out, None, int((time.time() - start) * 1000), kwargs), out)[1]):
+                return real
+            record(real, None, int((time.time() - start) * 1000), kwargs)
+            return real
+
         if inspect.isawaitable(resp):
             async def _awaited():
                 try:
@@ -588,12 +666,10 @@ def _wrap_call(original, record, label):
                 except Exception as e:
                     record(None, e, int((time.time() - start) * 1000), kwargs)
                     raise
-                record(real, None, int((time.time() - start) * 1000), kwargs)
-                return real
+                return _done(real)
             return _awaited()
 
-        record(resp, None, int((time.time() - start) * 1000), kwargs)
-        return resp
+        return _done(resp)
 
     wrapped._avowa_wrapped = True
     return wrapped
@@ -629,9 +705,16 @@ def _facts_from_request(kwargs):
     kinds = {"image": 0, "file": 0, "audio": 0}
     chars, system = 0, bool(kw.get("system") or kw.get("instructions"))
     if isinstance(msgs, list):
+        try:
+            roles["assistant"] += sum(1 for model, _ in _model_turns(msgs) if model) - sum(
+                1 for m in msgs if _get(m, "role") == "assistant")
+        except Exception:
+            pass
         for m in msgs:
             role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
             content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+            if (m.get("type") if isinstance(m, dict) else getattr(m, "type", None)) in _RESULT_ITEMS:
+                roles["tool"] += 1
             if role in ("system", "developer"):
                 system = True
             elif role in roles:
@@ -1079,14 +1162,42 @@ def _facts_from_response(resp, kwargs, salt=None):
     seen.extend(mcp)
     if offered:
         depth = _autonomy_depth(history)
+        key = _run_key(history, salt)
+        prev = kwargs.get("previous_response_id")
+        if prev:
+            parent = _chain_get(prev)
+            if parent is None:
+                depth, key = None, None
+            else:
+                key = parent[0]
+                depth = None if (parent[1] is None or depth is None) else parent[1] + depth
+        elif kwargs.get("conversation"):
+            depth, key = None, None
         if depth is not None:
             out["autonomy_depth"] = depth
             seen.append("autonomy_depth")
-        key = _run_key(history, salt)
         if key:
             out["agent_run_key"] = key
             seen.append("agent_run_key")
+        rid = _get(resp, "id")
+        if rid and _get(resp, "output") is not None:
+            _chain_put(rid, key, None if depth is None else depth + (1 if calls else 0))
     return out, seen
+
+
+_CHAIN, _CHAIN_MAX, _CHAIN_LOCK = {}, 4096, threading.Lock()
+
+
+def _chain_put(rid, key, next_depth):
+    with _CHAIN_LOCK:
+        _CHAIN[str(rid)] = (key, next_depth)
+        while len(_CHAIN) > _CHAIN_MAX:
+            _CHAIN.pop(next(iter(_CHAIN)))
+
+
+def _chain_get(rid):
+    with _CHAIN_LOCK:
+        return _CHAIN.get(str(rid))
 
 
 _TOOL_CAP = 60
@@ -1132,6 +1243,8 @@ def _tools_invoked(resp):
 
 
 def _run_key(messages, salt=None):
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
     if not isinstance(messages, list):
         return None
     for m in messages:
@@ -1161,28 +1274,48 @@ def _run_key(messages, salt=None):
     return None
 
 
+_MODEL_ITEMS = ("function_call", "custom_tool_call", "mcp_call", "computer_call", "web_search_call",
+                "file_search_call", "code_interpreter_call", "local_shell_call", "reasoning")
+_CALL_ITEMS = ("function_call", "custom_tool_call", "mcp_call", "computer_call", "local_shell_call")
+_RESULT_ITEMS = ("function_call_output", "custom_tool_call_output", "computer_call_output",
+                 "local_shell_call_output", "mcp_approval_response")
+
+
+def _model_turns(messages):
+    turns, cur = [], None
+    for m in messages:
+        role, typ = _get(m, "role"), _get(m, "type")
+        if not (typ in _MODEL_ITEMS or role == "assistant"):
+            cur = None
+            turns.append([False, False])
+            continue
+        tools = typ in _CALL_ITEMS
+        if role == "assistant":
+            if _get(m, "tool_calls"):
+                tools = True
+            c = _get(m, "content")
+            if isinstance(c, list) and any(_get(b, "type") == "tool_use" for b in c):
+                tools = True
+        if role == "assistant" and typ is None:
+            cur = None
+            turns.append([True, tools])
+            continue
+        if cur is None:
+            cur = [True, False]
+            turns.append(cur)
+        cur[1] = cur[1] or tools
+    return [(t[0], t[1]) for t in turns]
+
+
 def _autonomy_depth(messages):
+    if isinstance(messages, str):
+        return 0
     if not isinstance(messages, list):
         return None
-    depth = 0
-    for m in messages:
-        if not isinstance(m, dict):
-            try:
-                m = {"role": getattr(m, "role", None), "content": getattr(m, "content", None),
-                     "tool_calls": getattr(m, "tool_calls", None)}
-            except Exception:
-                continue
-        if m.get("role") != "assistant":
-            continue
-        if m.get("tool_calls"):
-            depth += 1
-            continue
-        c = m.get("content")
-        if isinstance(c, list) and any(
-                (b.get("type") if isinstance(b, dict) else getattr(b, "type", None)) == "tool_use"
-                for b in c):
-            depth += 1
-    return depth
+    try:
+        return sum(1 for model, tools in _model_turns(messages) if model and tools)
+    except Exception:
+        return None
 
 
 TOOL_OUTCOMES = ("ok", "error", "denied", "timeout")
@@ -1237,7 +1370,7 @@ def _tool_results(history):
     fresh = []
     for m in history:
         role, typ = _get(m, "role"), _get(m, "type")
-        if role == "assistant" or typ in ("function_call", "custom_tool_call"):
+        if role == "assistant" or typ in _MODEL_ITEMS:
             fresh = []
             continue
         if role == "tool":
@@ -1733,7 +1866,8 @@ class AvowaRuntime:
                     if kind == "parse" or kwargs.get("response_format") is not None:
                         extra["structured_output"] = True
                         seen.append("structured_output")
-                    seen += ["model", "endpoint", "latency_ms"] + (["error"] if err else [])
+                    seen += (["model"] if isinstance(getattr(resp, "model", None), str) else []) \
+                        + ["endpoint", "latency_ms"] + (["error"] if err else [])
                     if scan:
                         seen += ["pii_detected", "injection_suspected", "pii_families", "injection_families"]
                     extra["_sdk_observed"] = seen
@@ -1828,7 +1962,8 @@ class AvowaRuntime:
                     if method_name == "parse" and kwargs.get("output_format") is not None:
                         extra["structured_output"] = True
                         seen.append("structured_output")
-                    seen += ["model", "endpoint", "latency_ms"] + (["error"] if err else [])
+                    seen += (["model"] if isinstance(getattr(resp, "model", None), str) else []) \
+                        + ["endpoint", "latency_ms"] + (["error"] if err else [])
                     if scan:
                         seen += ["pii_detected", "injection_suspected", "pii_families", "injection_families"]
                     extra["_sdk_observed"] = seen
