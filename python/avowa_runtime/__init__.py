@@ -39,7 +39,7 @@ import urllib.request
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 __all__ = ["AvowaRuntime", "agent_context", "approval", "tool_outcome", "call_ref"]
 
 
@@ -1531,7 +1531,7 @@ class AvowaRuntime:
         self._pid = None
         if async_send:
             self._start_worker()
-            atexit.register(self.flush)
+            atexit.register(self._flush_at_exit)
             if hasattr(os, "register_at_fork"):
                 try:
                     os.register_at_fork(after_in_child=self._reset_after_fork)
@@ -1998,6 +1998,21 @@ class AvowaRuntime:
         except Exception:
             pass
 
+    def _flush_at_exit(self):
+        try:
+            t = float(os.getenv("AVOWA_FLUSH_TIMEOUT") or 5)
+        except ValueError:
+            t = 5.0
+        self.flush(timeout=t)
+        try:
+            left = self._q.unfinished_tasks if self._q is not None else 0
+        except Exception:
+            left = 0
+        if left:
+            sys.stderr.write("[avowa] %d signal(s) not sent before exit (upload still in progress after %gs). "
+                             "For short-lived processes set AVOWA_FLUSH_TIMEOUT higher, or call flush() before exiting.\n"
+                             % (left, t))
+
     def _run(self):
         while True:
             item = self._q.get()
@@ -2070,7 +2085,7 @@ class AvowaRuntime:
                 latest = reply.get("sdk_latest")
                 if isinstance(latest, str) and re.match(r"^\d+\.\d+\.\d+$", latest):
                     _warn_once("latest", "avowa_runtime %s is available (this is %s). Nothing is wrong — "
-                                         "upgrade when convenient (your Avowa Connections page has the download)." % (latest, __version__))
+                                         "upgrade when convenient: pip install -U avowa-runtime." % (latest, __version__))
             what = _evt_summary(events[0]) if len(events) == 1 else "%d events" % len(events)
             _dbg("sent %s → HTTP %s" % (what, getattr(resp, "status", None) or resp.getcode()))
         except Exception as e:

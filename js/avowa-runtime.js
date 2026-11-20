@@ -3,7 +3,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 const env = typeof process !== 'undefined' && process.env || {};
-const VERSION = '0.13.1';
+const VERSION = '0.13.2';
 const SCHEMA = 'avowa.signal/1';
 export const SDK_VERSION = VERSION;
 let _subtle = null;
@@ -592,7 +592,7 @@ export function createAvowa({
           const j = await r.clone().json();
           if (j && j.sdk_fields && secret && remoteOn()) await acceptFields(j.sdk_fields, secret);
           if (j && typeof j.sdk_latest === 'string' && /^\d+\.\d+\.\d+$/.test(j.sdk_latest)) {
-            warnOnce('latest', `@avowa/runtime ${j.sdk_latest} is available (this is ${VERSION}). Nothing is wrong — upgrade when convenient.`);
+            warnOnce('latest', `@avowa/runtime ${j.sdk_latest} is available (this is ${VERSION}). Nothing is wrong — upgrade when convenient: npm install @avowa/runtime@latest.`);
           }
         } catch {}
       }

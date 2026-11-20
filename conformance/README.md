@@ -1,11 +1,11 @@
 # Runtime evidence conformance
 
 `runtime-scenarios.json` describes provider calls and the Avowa runtime event each one must produce
-(the contract: `docs/RUNTIME_EVIDENCE_CONTRACT.md` in the Avowa repository, version `avowa.signal/1`).
+(envelope version `avowa.signal/1`).
 
 Every collector runs the same file:
 
-- the Python SDK and the OpenTelemetry parser: `backend/test_evidence_contract.py`
+- the Python SDK and Avowa's OpenTelemetry parser: Avowa's own test suite (not in this repository)
 - the Node SDK: `js/conformance.test.mjs`
 
 A collector for another language (a Java agent extension, a Go middleware) is finished when it
